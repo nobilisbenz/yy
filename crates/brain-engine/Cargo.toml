@@ -7,5 +7,12 @@ license.workspace = true
 
 [dependencies]
 brain-core = { workspace = true }
+brain-index = { workspace = true }
+brain-proto = { workspace = true }
+yalive = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

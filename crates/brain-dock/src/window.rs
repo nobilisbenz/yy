@@ -1,14 +1,15 @@
-//! Bridging Slint's window to `brain-x11`.
+//! Bridging iced's window to `brain-x11`.
 //!
-//! The XID only exists after the window has been realised, which under Slint
-//! means after the first `show()`. So the sequence is: show once to bring the
-//! X11 window into being, grab its id, apply our properties, then immediately
-//! unmap if we were asked to start hidden. The window then lives for the whole
-//! session and only its mapping changes.
+//! Under Slint the XID only existed after the first `show()`, so adoption
+//! retried on a timer. iced hands it over as a `Task`: `window::raw_id(id)`
+//! resolves once the window exists, and that `u64` *is* the XID. There is
+//! nothing to poll.
+//!
+//! Everything below this line is unchanged from the Slint build — it is EWMH
+//! and i3 behaviour, which no toolkit choice affects.
 
 use anyhow::{Context, Result};
 use brain_x11::{Anchor, DockWindow, Placement};
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 
 /// Geometry from config (spec §7). Logical pixels; with the scale factor
 /// pinned to 1.0 these are also physical pixels.
@@ -29,7 +30,7 @@ impl Default for DockGeometry {
             // than an offset from the screen edge.
             margin_top: 8,
             margin_side: 22,
-            width: 560,
+            width: crate::tokens::DOCK_WIDTH as u32,
         }
     }
 }
@@ -37,29 +38,20 @@ impl Default for DockGeometry {
 pub struct WindowController {
     x11: DockWindow,
     geometry: DockGeometry,
-    /// Last width we positioned against. Slint owns the actual size; we track
-    /// it only to know when the right edge needs recomputing.
+    /// Last width we positioned against. iced owns the actual size; we track it
+    /// only to know when the right edge needs recomputing.
     width: u32,
     restore_focus: bool,
 }
 
 impl WindowController {
-    /// Adopt the Slint window's underlying X11 window.
-    pub fn adopt(window: &slint::Window, geometry: DockGeometry) -> Result<Self> {
-        // The intermediate must outlive the borrow it hands out.
-        let slint_handle = window.window_handle();
-        let handle = slint_handle
-            .window_handle()
-            .context("the Slint window has no native handle yet — call after show()")?;
-
-        let xid = match handle.as_raw() {
-            RawWindowHandle::Xlib(handle) => handle.window as u32,
-            RawWindowHandle::Xcb(handle) => handle.window.get(),
-            other => anyhow::bail!(
-                "expected an X11 window, got {other:?}. Brain Dock is X11-only \
-                 (spec §2); check that SLINT_BACKEND is not forcing Wayland."
-            ),
-        };
+    /// Adopt the X11 window behind an iced window, given the id from
+    /// `iced::window::raw_id`.
+    pub fn adopt(xid: u64, geometry: DockGeometry) -> Result<Self> {
+        let xid = u32::try_from(xid).context(
+            "the window id does not fit in an X11 window id. Brain Dock is X11-only \
+             (spec §2); check that iced did not select the Wayland backend.",
+        )?;
 
         let x11 = DockWindow::adopt(xid).context("adopting the dock's X11 window")?;
         x11.apply_persistent_properties()
@@ -83,28 +75,33 @@ impl WindowController {
         self.x11.is_mapped()
     }
 
-    pub fn show(&mut self, width: u32) -> Result<()> {
+    /// Position the window and note what had focus, before the map.
+    pub fn prepare_show(&mut self, width: u32) -> Result<()> {
         self.width = width.max(1);
         self.x11
-            .show(&self.placement())
-            .context("showing the dock")?;
-        Ok(())
+            .prepare_show(&self.placement())
+            .context("positioning the dock")
     }
 
-    pub fn hide(&mut self) -> Result<()> {
+    /// Raise and take focus, after the map.
+    pub fn finish_show(&mut self) -> Result<()> {
+        self.x11.finish_show().context("showing the dock")
+    }
+
+    /// Park off-screen and give focus back, after the unmap.
+    pub fn finish_hide(&mut self) -> Result<()> {
         self.x11
-            .hide(self.restore_focus)
-            .context("hiding the dock")?;
-        Ok(())
+            .finish_hide(self.restore_focus)
+            .context("hiding the dock")
     }
 
-    /// Keep the anchored edge fixed when Slint resizes the window.
+    /// Keep the anchored edge fixed when the window resizes.
     ///
     /// For a top-right anchor only a width change moves the left edge; height
-    /// growth extends downward on its own, which is exactly what spec §41
-    /// asks for. So this is a no-op in the common case of an answer expanding,
-    /// and it deliberately skips the X11 round trip then — it is called on
-    /// every layout pass, including once per token batch while streaming.
+    /// growth extends downward on its own, which is exactly what spec §41 asks
+    /// for. So this is a no-op in the common case of an answer expanding, and
+    /// it deliberately skips the X11 round trip then — it is called on every
+    /// resize, including once per token batch while streaming.
     pub fn follow_resize(&mut self, width: u32) -> Result<()> {
         let width = width.max(1);
         if width == self.width {

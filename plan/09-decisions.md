@@ -27,6 +27,55 @@ The spec's architectural core is sound and is adopted unchanged:
 
 ## Deviations
 
+### 0. iced, not Slint — the UI toolkit
+
+The spec does not name a toolkit; the original plan chose Slint and Stage 0 shipped on it.
+The dock is now moving to **iced 0.14 + `iced_wgpu`**.
+
+Two reasons. The author prefers working in iced, which for a solo multi-month project is a
+real input and not a soft one. And the graph panel (`PLAN.md` §7) needs custom wgpu inside
+the dock window — on Slint that meant `unstable-wgpu-28` forcing the whole renderer onto
+wgpu, stacked on the two unstable features Stage 0 already depended on.
+
+iced 0.14 covers every hard requirement with **stable** API: `application_id` for
+`WM_CLASS` before first map, `Mode::Hidden` for show/hide, `widget::shader` for the panel,
+`transparent` for the ARGB visual, `raw_id()` for the XID, and `iced::daemon()`
+for a runtime that starts windowless. Net effect is three unstable dependencies removed.
+
+Cost: `brain-dock` and `ui/` are rewritten, and Stage 0's measurements must be re-earned.
+`brain-core`, `brain-proto`, `brain-daemon`, `brainctl`, and nearly all of `brain-x11` are
+untouched — the i3 and X11 findings below are toolkit-independent. Full accounting in
+`PLAN.md` §1.
+
+### 0b. `brain-index` wraps `yalive` — it does not reimplement it
+
+Stage 1 as written has this workspace build its own `migrations/001_initial.sql`, its own
+`sections` table, its own `pulldown-cmark` parser, its own FTS5, and its own watcher. **It
+does none of that.** `brain-index` is a wrapper over `yalive::db` and `yalive::parser`
+(`PLAN.md` §2.2, option A).
+
+The reason is identity, not effort. `yalive` keys everything on `section_uid`, and
+`relations`, `cards`, and `review_state` hang off it. A second parser with its own notion
+of a section would mean the graph could not be shared with `yGraphy`, review state could
+not inform ranking, and `Alt+1` would jump to a line computed by a *different parser* than
+the one that built the graph on screen.
+
+**What this changes about Stage 1.** Everything below that is genuinely better than what
+`yalive` had — `tokenchars '_-.'`, external-content FTS5, a migration runner, FTS5 query
+escaping, `heading_path`, one-writer/N-readers — is still built, but as an improvement
+*there*, where `yGraphy` and `yReviewy` inherit it. Same work, spent once. **All of it has
+now landed**, plus front-matter `status:`, which the `[search.status_weight]` block had
+been configuring into a void since it was never parsed.
+
+One placement in this section did not survive contact — see §11.
+
+**What it does not change.** `yy` deliberately indexes more than a vault — `~/projects`,
+code, PDFs, up to 50k files — and `yalive` is a Markdown vault indexer. Two databases is
+fine; two definitions of a section is not. The vault DB is read through `yalive`, and
+non-vault sources get a second store whose rows carry `source_kind` and no `section_uid`.
+Retrieval fuses both; only vault rows participate in graph expansion and review-state
+ranking.
+
 ### 1. Q5_K_M instead of Q4 — quantization
 
 Spec §21 specifies Q4. With 6 GB of VRAM and a 1.7B model, Q4 (~1.1 GB) versus Q5_K_M
@@ -34,12 +83,20 @@ Spec §21 specifies Q4. With 6 GB of VRAM and a 1.7B model, Q4 (~1.1 GB) versus 
 quantization damage on a model that is already small enough to be fragile. Q4 is the right
 default for a 7B+ model on constrained hardware; here it is an unforced loss.
 
-### 2. Show/hide via X11 map/unmap, not Slint `show()`/`hide()`
+### 2. Show/hide without destroying the window
 
 Spec §6 says "hidden rather than destroyed when dismissed" but does not say how. Toolkit
-hide/show can recreate the underlying window, losing the XID and every property set on it.
-Keeping the Slint window alive for the session and toggling only its X11 mapping is what
-makes the latency target reachable and the properties stable. Details in Stage 0.
+hide/show can recreate the underlying window, losing the XID and every property set on it
+— **Slint's `hide()` did exactly that**, and also exited the event loop, which is why
+Stage 0 drove `map_window`/`unmap_window` through `x11rb` instead.
+
+On iced 0.14 the intended primitive is `window::set_mode(id, Mode::Hidden)`, which
+should be winit `set_visible(false)` — an X11 unmap that preserves the window. **Verify
+this before building on it** (Stage 0′). If it destroys or recreates the window, fall back
+to the proven path: take the XID from `iced::window::raw_id()` and drive
+map/unmap with `x11rb`, exactly as `brain-x11` does today. Either way the window lives for
+the whole session and only its mapping toggles; that is what makes the latency target
+reachable and the properties stable.
 
 ### 3. Send `Sources` and `Actions` before generation, not after
 
@@ -92,18 +149,60 @@ Spec §52 mentions it as "better later". Do it as part of V1: i3 `exec` gives no
 restart-on-crash and no journal, and a daemon that silently dies is the worst failure mode
 this product has.
 
+### 11. FTS5 escaping lives in `yalive::search`, not `brain-index::fts`
+
+§0b put the escaping in `yy` on the reasoning that the expression language is `yy`'s problem
+while the schema is `yalive`'s. That line does not hold: **what counts as a term is decided
+by the tokenizer**, `tokenchars '_-.'`, which is part of the schema. Two copies of the
+escaping would be two things that have to keep agreeing with one tokenizer, and they would
+drift the first time the tokenizer changed.
+
+`yalive` cannot depend on `yy`, so the shared implementation has to live in `yalive`.
+`brain-index::fts` is now a re-export. This also fixed a real bug for free: `yalive`'s own
+TUI search built its expression by hand and threw on the first query containing an
+apostrophe.
+
+### 12. Retrieval joins query terms with `OR`, the TUI filter with `AND`
+
+Stage 1 §1.6 specifies `OR`; the first implementation used `AND`. Both are right, for
+different callers, so `yalive::search::Mode` names the choice:
+
+- **`Mode::All`** — the TUI's filter list, where each keystroke should *remove* rows.
+- **`Mode::Any`** — retrieval, with stopwords dropped first.
+
+Measured on the real vault, and the reason this is not a matter of taste:
+
+```text
+"how do I schedule a nightly backup?"   All:  0 hits
+                                        Any: 13 hits, "Nightly pg_dump to S3" first
+```
+
+`All` returns nothing at exactly the moment the user asks a real question, because no single
+section contains every word of a natural sentence. BM25 does the separating, and the seeds
+feed graph expansion, so recall is what matters at this stage.
+
+The stopword list is compared against a **punctuation-trimmed** form. Testing the raw word
+lets `for?` through as a content term, which then earns a heading-match boost on every note
+whose heading contains "for" — observed on the real vault before it was fixed.
+
 ---
 
 ## Risks, ranked
 
-### High — Slint transparency and window control on X11
+### High — transparency and window control on X11 (re-opened by the iced port)
 
 The dock's whole visual identity depends on a translucent, rounded, shadowed window. That
-needs an ARGB visual through winit, a running compositor, and Slint cooperating. If any
-link fails you fall back to an opaque card, which is fine but is not the reference design.
+needs an ARGB visual through winit, a running compositor, and the toolkit cooperating. If
+any link fails you fall back to an opaque card, which is fine but is not the reference
+design.
 
-*Mitigation:* prove it in the first hours of Stage 0, before building anything on it. The
-opaque fallback is documented and acceptable.
+Stage 0 **proved this on Slint** (depth-32 ARGB visual, picom on `egl`). The iced port
+re-opens it: `iced_wgpu` renders through wgpu/Vulkan rather than femtovg/GL, and
+`window::Settings.transparent` has to produce the same ARGB visual.
+
+*Mitigation:* prove it in the first hours of Stage 0′, before building anything on it —
+together with `Mode::Hidden` (deviation 2) and `application_id` → `WM_CLASS`. The opaque
+fallback is documented and acceptable.
 
 ### High — scope
 

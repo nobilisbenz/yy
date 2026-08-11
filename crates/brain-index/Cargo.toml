@@ -7,5 +7,15 @@ license.workspace = true
 
 [dependencies]
 brain-core = { workspace = true }
+# The vault index itself (PLAN.md §2.2 decision A). This crate wraps it; it does not
+# reimplement it.
+yalive = { workspace = true }
+anyhow = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
+notify = { workspace = true }
+notify-debouncer-full = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

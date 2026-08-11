@@ -49,12 +49,16 @@ pub async fn run(
 
     let sources = vec![SourceRef {
         section_id: SectionId(1),
+        // A real uid from the vault, so the graph panel has something to seed on before
+        // Stage 1 retrieval exists. Replaced by whatever the index returns.
+        section_uid: format!("{}#root", topic(&query)),
         path: format!("~/brain/{}.md", topic(&query)).into(),
         heading_path: "OBS workflows > Follow cursor > Smoothing".into(),
         start_line: 12,
         end_line: 18,
         score: -8.42,
         snippet: "Apply exponential smoothing before updating the crop transform.".into(),
+        explain: "matched heading · 1 hop to contradicts".into(),
     }];
 
     let _ = events.send(ServerEvent::RetrievalComplete {

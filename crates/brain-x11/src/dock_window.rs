@@ -156,6 +156,59 @@ impl DockWindow {
         Ok(())
     }
 
+    /// Everything a summon needs *before* the window is mapped.
+    ///
+    /// Split out of [`show`](Self::show) for callers whose toolkit owns the map
+    /// itself — iced maps through winit, and a window winit believes is hidden
+    /// stays unmapped no matter who sends the `MapWindow`: measured on i3, the
+    /// request is honoured, the window is managed, and it is withdrawn again
+    /// immediately. Pair with [`finish_show`](Self::finish_show) around the
+    /// toolkit's own show call.
+    ///
+    /// Positioning belongs here: doing it while unmapped is what keeps the dock
+    /// from appearing at the wrong coordinates for a frame.
+    pub fn prepare_show(&mut self, placement: &Placement) -> Result<(), X11Error> {
+        self.previous_focus = geometry::active_window(&self.conn, self.root, &self.atoms)
+            .ok()
+            .flatten()
+            .filter(|&w| w != self.window);
+
+        let area = geometry::active_work_area(&self.conn, self.root, &self.atoms)?;
+        self.move_resize(placement, &area)?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// Stacking and focus, once the toolkit has mapped the window.
+    ///
+    /// See [`show`](Self::show) for why the raise is what actually keeps the
+    /// dock on top under i3.
+    pub fn finish_show(&mut self) -> Result<(), X11Error> {
+        self.mapped = true;
+        self.raise()?;
+        self.request_above()?;
+        self.focus()?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    /// The other half of [`hide`](Self::hide), for the same split callers: run
+    /// once the toolkit has unmapped the window.
+    pub fn finish_hide(&mut self, restore_focus: bool) -> Result<(), X11Error> {
+        self.mapped = false;
+        self.park_offscreen()?;
+
+        if restore_focus && let Some(previous) = self.previous_focus.take() {
+            // Best-effort: the window may have closed while we were open.
+            if let Err(err) = self.activate(previous) {
+                tracing::debug!(%err, "could not restore focus to the previous window");
+            }
+        }
+
+        self.conn.flush()?;
+        Ok(())
+    }
+
     /// Resize in place, keeping the anchor fixed.
     ///
     /// The answer expands downward; the top-right corner must not move

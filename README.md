@@ -9,17 +9,25 @@ Build plan: [`plan/`](plan/README.md).
 
 ---
 
-## Status: Stage 0 complete
+## Status: Stage 0 complete, on iced
 
 The interaction is proven end to end. There is no index and no model yet — the
 query pipeline is a mock whose delays mirror measured hardware timings.
 
+**The dock moved from Slint to iced 0.14 and Slint is gone.** The decision and
+what it cost are in [`../PLAN.md`](../PLAN.md) §1; what the port itself taught us
+is in [`plan/01-stage-0-dock.md`](plan/01-stage-0-dock.md). Two Stage 0 numbers
+have not been re-measured on iced: end-to-end summon latency, and anything
+multi-monitor — this machine has one output.
+
 | Stage | | |
 |---|---|---|
 | 0 | Dock, IPC, window control, streaming | **done** |
-| 1 | SQLite + FTS5 index, Markdown parser, file watcher | next |
+| 0′ | Port `brain-dock` to iced 0.14; re-prove Stage 0 | **done** |
+| 1 | SQLite + FTS5 index, Markdown parser, file watcher | in progress |
 | 2 | Qwen3 answers via llama-server | |
 | 3–7 | Actions, desktop context, embeddings, corrections, benchmark | |
+| E | Graph panel embedded in the dock (`brainctl graph toggle`) | **done** |
 
 ### What works
 
@@ -31,6 +39,7 @@ Ctrl+L / Ctrl+C         clear query / copy answer to clipboard
 Up / Down               query history
 Tab / Shift+Tab         cycle action buttons
 Alt+1..9                activate an action       (wired, targets land in Stage 3)
+brainctl graph toggle   graph panel under the answer, seeded on its source
 brainctl status|doctor|ask|toggle|show|hide
 ```
 
@@ -61,7 +70,7 @@ around for tuning UI timing without loading a model.
 ### i3
 
 ```i3
-for_window [class="BrainDock"] floating enable, border pixel 0, sticky enable
+for_window [class="brain-dock"] floating enable, border pixel 0, sticky enable
 focus_on_window_activation smart
 
 exec --no-startup-id brain-daemon
@@ -82,7 +91,7 @@ $mod+a ──► brainctl ──┐
                 brain-daemon ──────► index, model, caches (all hot, all resident)
                       │
                       ▼
-                 brain-dock  ──────► Slint + X11
+                 brain-dock  ──────► iced + X11
 ```
 
 Three binaries and five libraries. The daemon stays hot so summoning the dock
@@ -111,8 +120,8 @@ These are structural, not stylistic. Changing one is a design decision.
   for a moment; without the id its tail lands in the next answer.
 - **The daemon owns visibility.** That is what lets `brainctl` be a stateless
   one-shot binary that knows nothing about windows.
-- **Visual constants live in `ui/tokens.slint`.** No colour, radius, or duration
-  in Rust.
+- **Visual constants live in `crates/brain-dock/src/tokens.rs`.** One module owns every colour, radius,
+  and duration; no literal appears anywhere else.
 - **Tunables live in `config/`.** Stage 7 settles ranking by benchmark sweep, and
   a literal in a source file cannot be swept.
 

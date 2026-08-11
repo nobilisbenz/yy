@@ -3,7 +3,7 @@
 
 **Target environment:** Ubuntu 26, X11, i3 window manager  
 **Primary language:** Rust  
-**UI:** Slint  
+**UI:** iced 0.14 (`iced_wgpu`)  
 **Local LLM:** Qwen3 1.7B, GGUF, Q4 quantization  
 **Inference:** llama.cpp with CUDA  
 **Primary storage:** SQLite + FTS5  
@@ -251,15 +251,15 @@ Set a stable class, for example:
 
 ```text
 WM_CLASS instance = brain-dock
-WM_CLASS class    = BrainDock
+WM_CLASS class    = brain-dock   # iced's application_id sets both fields identically
 ```
 
 Recommended i3 config:
 
 ```i3
-for_window [class="BrainDock"] floating enable
-for_window [class="BrainDock"] border pixel 0
-for_window [class="BrainDock"] sticky enable
+for_window [class="brain-dock"] floating enable
+for_window [class="brain-dock"] border pixel 0
+for_window [class="brain-dock"] sticky enable
 ```
 
 i3 supports applying commands such as floating and border rules through `for_window` criteria.
@@ -296,7 +296,7 @@ x = monitor.x + monitor.width - dock.width - margin_right
 y = monitor.y + margin_top
 ```
 
-Slint exposes desktop window position and size APIs; on X11 the application can set a physical screen position. Slint also exposes `always-on-top` and frameless-window properties on supported window managers.
+iced exposes per-window position, size, `Level` (always-on-top), `decorations`, `transparent`, and `Mode` (`Windowed | Fullscreen | Hidden`). On X11 the physical screen position is set directly. Where EWMH behaviour is needed beyond what the toolkit exposes — i3 ignores `_NET_WM_STATE_ABOVE`, and `_NET_WORKAREA` is not published — `brain-x11` drives the XID with `x11rb`; see `plan/01-stage-0-dock.md`.
 
 ---
 
@@ -331,7 +331,7 @@ Super+Space ───────────────►│     brainctl    
                                        ▼
                               ┌──────────────────┐
                               │    brain-dock    │
-                              │   Slint + X11    │
+                              │    iced + X11    │
                               └──────────────────┘
 ```
 
@@ -385,7 +385,7 @@ brain-dock/
 │   └── brainctl/
 │
 ├── ui/
-│   ├── dock.slint
+│   ├── dock.rs
 │   ├── components/
 │   └── assets/
 │
@@ -1553,22 +1553,25 @@ Do not build automatic model routing in V1.
 
 # 40. UI technology
 
-Use **Slint + Rust** for the dock.
+Use **iced 0.14 + Rust** for the dock.
 
-Slint is a native declarative UI toolkit with Rust support. Its window API supports showing/hiding a window and controlling position; its declarative `Window` properties include frameless and always-on-top behavior on supported window managers.
+iced is a native Elm-architecture UI toolkit in Rust. `iced::daemon()` runs without a window and does not exit when its windows close, which matches a dock that is resident from login and summoned on a keystroke. `window::Settings` covers frameless, transparent, and always-on-top; `window::set_mode` covers show/hide without destroying the window; `iced::widget::shader` hosts custom wgpu, which is what the graph panel needs.
+
+*(Superseded §67's original choice of Slint. Rationale and cost in `../PLAN.md` §1 and `plan/09-decisions.md` deviation 0.)*
 
 Suggested UI files:
 
 ```text
 ui/
-├── dock.slint
+├── dock.rs
 ├── components/
-│   ├── SearchInput.slint
-│   ├── AnswerText.slint
-│   ├── ActionButton.slint
-│   ├── SourceBadge.slint
-│   └── LoadingIndicator.slint
-└── tokens.slint
+│   ├── search_input.rs
+│   ├── answer_text.rs
+│   ├── action_button.rs
+│   ├── source_badge.rs
+│   └── loading.rs
+├── graph.rs          # shader::Program panel
+└── tokens.rs
 ```
 
 Keep visual design tokens centralized:
@@ -2094,7 +2097,7 @@ Goal: prove the interaction.
 
 Build:
 
-- Slint window;
+- iced window;
 - X11 top-right position;
 - i3 floating rule;
 - Super+Space toggle;
@@ -2242,7 +2245,7 @@ Only after this consider:
 
 ```text
 Cargo workspace
-Slint dock
+iced dock
 show/hide
 positioning
 X11 class
@@ -2619,7 +2622,7 @@ Optimize that first.
 ```text
 Language              Rust
 Async/runtime          Tokio
-UI                    Slint
+UI                    iced 0.14
 X11/EWMH integration  x11rb or equivalent low-level X11 crate
 Database              SQLite
 Text search            SQLite FTS5 / BM25
@@ -2658,9 +2661,11 @@ These are useful implementation references current at the time this specificatio
 - Qwen3 project/release information: https://github.com/QwenLM/Qwen3
 - llama.cpp: https://github.com/ggml-org/llama.cpp
 - SQLite FTS5: https://www.sqlite.org/fts5.html
-- Slint: https://slint.dev/
-- Slint Window reference: https://docs.slint.dev/latest/docs/slint/reference/window/window/
-- Slint Rust Window API: https://docs.slint.dev/latest/docs/rust/slint/struct.Window
+- iced: https://iced.rs/
+- iced window API: https://docs.rs/iced/latest/iced/window/index.html
+- iced::window::Mode: https://docs.rs/iced/latest/iced/window/enum.Mode.html
+- iced::daemon: https://docs.rs/iced/latest/iced/fn.daemon.html
+- iced::widget::shader: https://docs.rs/iced/latest/iced/widget/shader/index.html
 - i3 User Guide: https://i3wm.org/docs/userguide.html
 
 ---
@@ -2676,7 +2681,7 @@ These are useful implementation references current at the time this specificatio
                               │
                               ▼
                    ┌───────────────────┐
-                   │  Slint Dock UI    │
+                   │   iced Dock UI    │
                    │  top-right float  │
                    └─────────┬─────────┘
                              │ Unix socket

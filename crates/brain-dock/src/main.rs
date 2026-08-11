@@ -1,54 +1,71 @@
-//! `brain-dock` — the window.
+//! `brain-dock` on iced — the window.
 //!
 //! Deliberately thin. It renders what the daemon sends and forwards what the
 //! user does; it holds no index, no model, and no opinions about retrieval.
 //! Keeping it that way is what lets it stay resident and appear instantly.
 //!
-//! Threading: Slint owns the main thread and Tokio gets its own. The X11
-//! controller is reachable only from the UI thread — it is not `Send`, and
-//! every caller is a Slint callback or an `invoke_from_event_loop` closure,
-//! both of which already run there.
+//! Runtime: `iced::daemon()` rather than `iced::application()`. A daemon starts
+//! with no window and does not exit when its windows close, which is exactly
+//! "resident from login, summoned on a keystroke".
+//!
+//! The window is nonetheless opened at boot in both cases, invisible
+//! (`Settings.visible = false`). Deferring the open would defer the XID with
+//! it, and every X11 property has to be on the window *before* its first map —
+//! i3 evaluates `for_window` at map time. `--hidden` therefore means "do not
+//! map yet", and the Slint-era race against the toolkit's own async map is gone
+//! rather than worked around.
+//!
+//! Visibility is the daemon's to decide (that is what keeps `brainctl` a
+//! stateless one-shot binary), so nothing here toggles the window on its own;
+//! it acts on `ShowDock`/`HideDock`.
 
+mod graph;
 mod ipc;
 mod keys;
+mod layout;
 mod platform;
-mod stream;
+mod tokens;
+mod view;
 mod window;
 
-use std::cell::{Cell, RefCell};
+use std::time::Instant;
 
-use anyhow::{Context, Result};
-use brain_proto::{ClientRequest, ServerEvent};
+use brain_proto::{ActionView, ClientRequest, DesktopContext, ServerEvent, SourceRef};
 use clap::Parser;
-use slint::Model as _;
+use iced::futures::channel::mpsc;
+use iced::{Element, Subscription, Task, Theme};
+use uuid::Uuid;
+
 use window::{DockGeometry, WindowController};
 
-slint::include_modules!();
-
-thread_local! {
-    /// UI-thread-only. See the module comment.
-    static WINDOW: RefCell<Option<WindowController>> = const { RefCell::new(None) };
-
-    /// The query currently on screen. Events for any other are discarded.
-    static CURRENT_QUERY: Cell<Option<uuid::Uuid>> = const { Cell::new(None) };
-
-    static HISTORY: RefCell<keys::History> = RefCell::new(keys::History::new());
+/// Spec §4's states, minus Hidden — hiding is an X11 unmap, not a UI state, so
+/// the window has nothing to draw for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DockState {
+    Input,
+    Searching,
+    Answer,
+    NoAnswer,
 }
 
-fn current_query() -> Option<uuid::Uuid> {
-    CURRENT_QUERY.with(Cell::get)
+/// The retrieved source shown under the answer.
+pub struct Source {
+    pub path: String,
+    pub heading: String,
+    /// Empty for a source with no vault identity; the graph panel skips those.
+    pub section_uid: String,
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "brain-dock", version, about = "Brain Dock window")]
 struct Args {
-    /// Start unmapped. This is how i3 launches it: resident from login,
-    /// mapped by `brainctl toggle`.
+    /// Start hidden. This is how i3 launches it: resident from login, revealed
+    /// by `brainctl toggle`.
     #[arg(long)]
     hidden: bool,
 
-    /// Override the UI scale factor. Slint's guess is wrong on some panels;
-    /// 1.0 matches an unscaled 96 DPI X session.
+    /// Override the UI scale factor. 1.0 matches an unscaled 96 DPI X session,
+    /// which is what the geometry tokens are drawn against.
     #[arg(long, default_value = "1.0")]
     scale: f32,
 
@@ -60,467 +77,28 @@ struct Args {
     log: String,
 }
 
-fn main() -> Result<()> {
+fn main() -> iced::Result {
     let args = Args::parse();
     init_tracing(&args.log);
+    platform::pin_scale_factor(args.scale);
 
-    platform::install(args.scale)?;
-    let dock = Dock::new().context("creating the dock window")?;
-
-    // `show()` only *schedules* window creation; winit realises it on the first
-    // event-loop iteration, so the XID does not exist yet and adopting here
-    // fails with "the underlying handle cannot be represented". Adoption
-    // therefore happens from inside the loop — see `adopt_when_ready`.
-    dock.show().context("realising the dock window")?;
-    adopt_when_ready(&dock, args.hidden, args.restore_focus);
-
-    let to_daemon = ipc::spawn({
-        let weak = dock.as_weak();
-        move |event| {
-            let weak = weak.clone();
-            // Hop to the UI thread. This is the only supported way to touch a
-            // Slint component from elsewhere.
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(dock) = weak.upgrade() {
-                    apply(&dock, event);
-                }
-            });
-        }
-    });
-
-    wire_callbacks(&dock, to_daemon);
-
-    slint::run_event_loop().context("running the Slint event loop")?;
-    Ok(())
-}
-
-/// Take ownership of the X11 window once winit has created it.
-///
-/// Scheduled as a zero-delay timer, which fires on the first event-loop
-/// iteration — after `Resumed`, and so after the window exists. The retry is
-/// not superstition: window creation is asynchronous and the exact iteration it
-/// lands on is a winit implementation detail we should not depend on.
-fn adopt_when_ready(dock: &Dock, start_hidden: bool, restore_focus: bool) {
-    try_adopt(dock.as_weak(), start_hidden, restore_focus, 0);
-}
-
-fn try_adopt(weak: slint::Weak<Dock>, start_hidden: bool, restore_focus: bool, attempt: u32) {
-    const RETRY_EVERY: std::time::Duration = std::time::Duration::from_millis(10);
-    const GIVE_UP_AFTER: u32 = 50; // ~500 ms
-
-    // A repeating timer would need to stop itself, and `Timer` is neither
-    // `Clone` nor reachable from its own callback. Chaining single-shots
-    // sidesteps that: each failure schedules exactly one more attempt.
-    slint::Timer::single_shot(
-        if attempt == 0 {
-            std::time::Duration::ZERO
-        } else {
-            RETRY_EVERY
-        },
-        move || {
-            let Some(dock) = weak.upgrade() else { return };
-
-            match WindowController::adopt(dock.window(), DockGeometry::default()) {
-                Ok(mut controller) => {
-                    controller.set_restore_focus(restore_focus);
-
-                    let width = dock.window().size().width;
-                    let result = if start_hidden {
-                        controller.hide()
-                    } else {
-                        controller.show(width)
-                    };
-                    if let Err(err) = result {
-                        tracing::error!("{err:#}");
-                    }
-
-                    WINDOW.with(|slot| *slot.borrow_mut() = Some(controller));
-                    tracing::info!(hidden = start_hidden, attempt, "window ready");
-
-                    if start_hidden {
-                        reassert_hidden(0);
-                    }
-                }
-                Err(err) if attempt + 1 >= GIVE_UP_AFTER => {
-                    tracing::error!(
-                        "{err:#}\nGiving up on the X11 window. The dock will render but \
-                         cannot be positioned or toggled."
-                    );
-                }
-                Err(_) => try_adopt(weak, start_hidden, restore_focus, attempt + 1),
-            }
-        },
-    );
-}
-
-/// Keep a `--hidden` dock hidden through toolkit startup.
-///
-/// Slint maps the window itself, asynchronously, and that map can arrive after
-/// our unmap — a race we lose about half the time, which showed up as the dock
-/// appearing at login despite `--hidden`. The window is parked off-screen while
-/// hidden so the flash is invisible either way; this closes the window state
-/// itself over the first few hundred milliseconds, then stops.
-fn reassert_hidden(attempt: u32) {
-    const EVERY: std::time::Duration = std::time::Duration::from_millis(30);
-    const ATTEMPTS: u32 = 10;
-
-    slint::Timer::single_shot(EVERY, move || {
-        // Only re-hide if nobody has legitimately summoned us in the meantime.
-        if visible() {
-            return;
-        }
-        with_window(WindowController::hide);
-        if attempt + 1 < ATTEMPTS {
-            reassert_hidden(attempt + 1);
-        }
-    });
-}
-
-/// Apply a daemon event to the UI. Runs on the UI thread.
-fn apply(dock: &Dock, event: ServerEvent) {
-    // Drop anything belonging to a query we have moved on from. The daemon
-    // cancels superseded queries, but events already in flight still arrive.
-    if let Some(id) = event.query_id()
-        && Some(id) != current_query()
-    {
-        tracing::trace!(%id, "discarding event from a superseded query");
-        return;
-    }
-
-    match event {
-        ServerEvent::ShowDock { .. } => show(dock),
-        ServerEvent::HideDock => hide(dock),
-
-        ServerEvent::QueryAccepted { id } => stream::begin(id),
-
-        ServerEvent::RetrievalStarted { .. } => {
-            dock.set_state(DockState::Searching);
-            dock.set_status_line("Searching…".into());
-        }
-
-        // Sources land before generation starts, so the path and the action
-        // buttons are on screen while the model is still warming up.
-        ServerEvent::Sources { items, .. } => {
-            let primary = items.first();
-            dock.set_source_path(
-                primary
-                    .map(|s| s.path.display().to_string())
-                    .unwrap_or_default()
-                    .into(),
-            );
-            dock.set_source_heading(
-                primary
-                    .map(|s| s.heading_path.clone())
-                    .unwrap_or_default()
-                    .into(),
-            );
-            dock.set_extra_sources(items.len().saturating_sub(1) as i32);
-        }
-
-        ServerEvent::Actions { items, .. } => {
-            let actions: Vec<ActionItem> = items
-                .iter()
-                .map(|action| ActionItem {
-                    label: action.label.clone().into(),
-                    enabled: action.enabled,
-                })
-                .collect();
-            dock.set_actions(slint::ModelRc::new(slint::VecModel::from(actions)));
-            dock.set_selected_action(-1);
-        }
-
-        ServerEvent::GenerationStarted { .. } => {
-            dock.set_answer(Default::default());
-            dock.set_state(DockState::Answer);
-        }
-
-        ServerEvent::Token { id, text } => {
-            let weak = dock.as_weak();
-            stream::push(id, &text, move |answer| {
-                if let Some(dock) = weak.upgrade() {
-                    dock.set_answer(answer.into());
-                }
-            });
-        }
-
-        ServerEvent::Complete { timing, cache, .. } => {
-            let weak = dock.as_weak();
-            // Flush the last partial batch, or the answer loses its final words.
-            stream::flush(move |answer| {
-                if let Some(dock) = weak.upgrade() {
-                    dock.set_answer(answer.into());
-                }
-            });
-            dock.set_state(DockState::Answer);
-            tracing::info!(
-                retrieval_ms = timing.retrieval_ms,
-                ttft_ms = timing.ttft_ms,
-                total_ms = timing.total_ms,
-                tokens = timing.output_tokens,
-                answer_cached = cache.answer_hit,
-                "query complete"
-            );
-        }
-
-        ServerEvent::NoAnswer { closest, .. } => {
-            // A confident "not in your files" is a feature, not an error
-            // (spec §45). The model was never called.
-            dock.set_answer("I couldn't find a reliable answer in your indexed files.".into());
-            dock.set_state(DockState::NoAnswer);
-            if let Some(first) = closest.first() {
-                dock.set_source_path(first.path.display().to_string().into());
-                dock.set_source_heading(first.heading_path.clone().into());
-                dock.set_extra_sources(closest.len().saturating_sub(1) as i32);
-            }
-        }
-
-        ServerEvent::Error { message, .. } => {
-            tracing::warn!(message, "daemon reported an error");
-            dock.set_status_line(message.into());
-            dock.set_state(DockState::Searching);
-        }
-
-        other => tracing::trace!(?other, "unhandled event"),
-    }
-
-    // Any state change can relayout the card. For a top-right anchor only a
-    // width change matters; height growth extends downward by design.
-    with_window(|controller| controller.follow_resize(dock.window().size().width));
-}
-
-fn show(dock: &Dock) {
-    with_window(|controller| controller.show(dock.window().size().width));
-    dock.set_revealed(true);
-
-    // Focus the field *after* mapping: focusing an unmapped window is a no-op,
-    // and the dock would come up with no caret.
-    dock.invoke_focus_query();
-}
-
-fn hide(dock: &Dock) {
-    dock.set_revealed(false);
-
-    // Let the fade finish before unmapping, or the card vanishes instead of
-    // fading. Unmapping is what actually hides it; the animation is only worth
-    // waiting for because it is shorter than a frame budget's worth of delay.
-    let weak = dock.as_weak();
-    slint::Timer::single_shot(std::time::Duration::from_millis(80), move || {
-        // If the user re-summoned during the fade, leave it alone.
-        if weak.upgrade().is_some_and(|dock| dock.get_revealed()) {
-            return;
-        }
-        with_window(WindowController::hide);
-    });
-
-    // Deliberately does not clear the query or answer. Reopening a second
-    // later should show what was there (spec §42).
-}
-
-fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<ClientRequest>) {
-    dock.on_dismiss({
-        let weak = dock.as_weak();
-        let tx = to_daemon.clone();
-        move || {
-            if !visible() {
-                return;
-            }
-            // Route through the daemon rather than hiding locally, so the
-            // daemon's `visible` flag stays in step. Otherwise the next
-            // `brainctl toggle` would try to hide an already-hidden dock.
-            let _ = tx.send(ClientRequest::Hide);
-            // Hide immediately as well: waiting for the round trip would show
-            // a perceptible delay on a keypress that should feel instant.
-            if let Some(dock) = weak.upgrade() {
-                hide(&dock);
-            }
-        }
-    });
-
-    dock.on_submit({
-        let weak = dock.as_weak();
-        let tx = to_daemon.clone();
-        move |text| {
-            if text.trim().is_empty() {
-                return;
-            }
-
-            // Abandon whatever is running. The daemon supersedes it too, but
-            // saying so explicitly means a slow query stops costing tokens the
-            // moment the user asks something else.
-            if let Some(previous) = current_query() {
-                let _ = tx.send(ClientRequest::Cancel { id: previous });
-            }
-
-            let id = uuid::Uuid::new_v4();
-            CURRENT_QUERY.with(|cell| cell.set(Some(id)));
-            stream::begin(id);
-            HISTORY.with(|h| h.borrow_mut().push(&text));
-
-            if let Some(dock) = weak.upgrade() {
-                dock.set_state(DockState::Searching);
-                dock.set_status_line("Searching…".into());
-                dock.set_answer(Default::default());
-                dock.set_source_path(Default::default());
-                dock.set_source_heading(Default::default());
-                dock.set_extra_sources(0);
-                dock.set_actions(slint::ModelRc::new(slint::VecModel::from(
-                    Vec::<ActionItem>::new(),
-                )));
-            }
-
-            let _ = tx.send(ClientRequest::Query {
-                id,
-                text: text.to_string(),
-                context: Default::default(),
-                retrieval_only: false,
-            });
-        }
-    });
-
-    dock.on_edited(|_text| {
-        // Live retrieval lands in Stage 1, where there is an index to search.
-    });
-
-    dock.on_activate_action(|index| {
-        tracing::info!(index, "action activated (Stage 3)");
-    });
-
-    dock.on_shortcut({
-        let weak = dock.as_weak();
-        let tx = to_daemon.clone();
-        move |name| {
-            let Some(dock) = weak.upgrade() else { return };
-            let Some(command) = keys::Command::parse(&name) else {
-                tracing::debug!(%name, "unknown shortcut");
-                return;
-            };
-            handle_shortcut(&dock, command, &tx);
-        }
-    });
-
-    // Slint resizes the window as the answer grows. Keep the anchored edge
-    // fixed when that changes the width.
-    dock.window().on_close_requested(|| {
-        // A frameless dock has no close button, but a WM can still send this.
-        // Hiding rather than quitting keeps the process resident.
-        with_window(WindowController::hide);
-        slint::CloseRequestResponse::KeepWindowShown
-    });
-}
-
-fn handle_shortcut(
-    dock: &Dock,
-    command: keys::Command,
-    tx: &tokio::sync::mpsc::UnboundedSender<ClientRequest>,
-) {
-    use keys::Command;
-
-    match command {
-        Command::ClearQuery => {
-            dock.invoke_clear();
-            dock.set_state(DockState::Input);
-        }
-
-        Command::CopyAnswer => {
-            // Copy what has streamed so far, not the last flushed batch:
-            // Ctrl+C mid-answer should give you everything on screen.
-            let answer = stream::current();
-            if answer.is_empty() {
-                return;
-            }
-            match copy_to_clipboard(&answer) {
-                Ok(()) => tracing::info!(chars = answer.len(), "answer copied"),
-                Err(err) => tracing::error!("{err:#}"),
-            }
-        }
-
-        Command::HistoryPrevious => {
-            let current = dock.get_query().to_string();
-            if let Some(entry) = HISTORY.with(|h| h.borrow_mut().previous(&current)) {
-                dock.set_query(entry.into());
-            }
-        }
-        Command::HistoryNext => {
-            if let Some(entry) = HISTORY.with(|h| h.borrow_mut().next()) {
-                dock.set_query(entry.into());
-            }
-        }
-
-        Command::SelectNextAction | Command::SelectPreviousAction => {
-            let count = dock.get_actions().row_count() as i32;
-            if count == 0 {
-                return;
-            }
-            let step = if command == Command::SelectNextAction { 1 } else { -1 };
-            // Wraps in both directions; `rem_euclid` keeps -1 at the end
-            // rather than off the front.
-            let next = (dock.get_selected_action() + step).rem_euclid(count);
-            dock.set_selected_action(next);
-        }
-
-        Command::Activate(index) => {
-            if index < dock.get_actions().row_count() {
-                dock.invoke_activate_action(index as i32);
-            }
-        }
-
-        Command::Retry => {
-            let query = dock.get_query().to_string();
-            if !query.trim().is_empty() {
-                dock.invoke_submit(query.into());
-            }
-        }
-
-        // Both need somewhere to put the result, which arrives with the
-        // correction editor (Stage 6) and the sources panel (Stage 1).
-        Command::EditAnswer | Command::ShowSources => {
-            tracing::info!(?command, "not implemented yet");
-        }
-    }
-
-    let _ = tx;
-}
-
-/// X11 clipboard ownership requires a live process holding the selection, so
-/// the copy has to outlive this function. `arboard` keeps a background thread
-/// for exactly that; the handle is parked for the process lifetime rather than
-/// recreated per copy, which would drop the selection each time.
-fn copy_to_clipboard(text: &str) -> Result<()> {
-    thread_local! {
-        static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
-    }
-
-    CLIPBOARD.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        if slot.is_none() {
-            *slot = Some(arboard::Clipboard::new().context("opening the clipboard")?);
-        }
-        slot.as_mut()
-            .expect("just initialised")
-            .set_text(text)
-            .context("writing to the clipboard")
+    iced::daemon(
+        move || Dock::boot(&args),
+        Dock::update,
+        Dock::view as fn(&Dock, iced::window::Id) -> Element<'_, Message>,
+    )
+    .title(|_state: &Dock, _id| String::from("Brain Dock"))
+    .theme(|_state: &Dock, _id| Theme::Dark)
+    // Without this the theme paints an opaque background over the whole
+    // window and the depth-32 ARGB visual buys nothing — the rounded corners
+    // and the shadow both come from picom seeing through to the desktop.
+    // The card's own translucent fill is `view`'s container style.
+    .style(|_state: &Dock, _theme| iced::theme::Style {
+        background_color: iced::Color::TRANSPARENT,
+        text_color: tokens::FG,
     })
-}
-
-fn visible() -> bool {
-    WINDOW.with(|slot| {
-        slot.borrow()
-            .as_ref()
-            .is_some_and(WindowController::is_visible)
-    })
-}
-
-fn with_window(action: impl FnOnce(&mut WindowController) -> Result<()>) {
-    WINDOW.with(|slot| {
-        let mut slot = slot.borrow_mut();
-        let Some(controller) = slot.as_mut() else {
-            tracing::error!("window controller is not initialised");
-            return;
-        };
-        if let Err(err) = action(controller) {
-            tracing::error!("{err:#}");
-        }
-    });
+    .subscription(Dock::subscription)
+    .run()
 }
 
 fn init_tracing(filter: &str) {
@@ -532,4 +110,751 @@ fn init_tracing(filter: &str) {
         .with_target(false)
         .with_timer(fmt::time::uptime())
         .init();
+}
+
+#[derive(Debug, Clone)]
+pub enum Message {
+    Ipc(ipc::Event),
+    WindowOpened(iced::window::Id),
+    /// The XID, from `window::raw_id`. Adoption happens on receipt.
+    Adopted(u64),
+    QueryChanged(String),
+    Submit,
+    /// A named shortcut, resolved through `keys::Command`.
+    Command(keys::Command),
+    Dismiss,
+    /// A frame, while the summon fade is running.
+    Tick(std::time::Instant),
+    /// A frame, while the graph panel's force simulation is still moving.
+    GraphTick,
+    /// The user did something to the graph panel.
+    Graph(ygraphy::panel::Interaction),
+    /// The fade-out has had its time; the window may be unmapped now.
+    FadeOutElapsed,
+    /// The toolkit finished mapping or unmapping the window.
+    VisibilityChanged(bool),
+    /// The window manager asked the window to close.
+    CloseRequested,
+    ActivateAction(usize),
+}
+
+impl From<ygraphy::panel::Interaction> for Message {
+    fn from(interaction: ygraphy::panel::Interaction) -> Self {
+        Self::Graph(interaction)
+    }
+}
+
+pub struct Dock {
+    // --- runtime wiring ----------------------------------------------------
+    window: Option<iced::window::Id>,
+    x11: Option<WindowController>,
+    geometry: DockGeometry,
+    /// Newest sender from the IPC subscription. `None` while disconnected —
+    /// the dock stays usable and simply has nowhere to send.
+    requests: Option<mpsc::Sender<ClientRequest>>,
+    start_hidden: bool,
+    restore_focus: bool,
+    /// Height last asked of `window::resize`. Compared against every update so
+    /// a token batch that does not add a line costs no X11 traffic.
+    requested_height: f32,
+
+    /// The graph panel, once it has been opened at least once. Loading a vault and
+    /// laying it out is not work a dock resident from login should do for a panel nobody
+    /// asked for, so this stays `None` until the first `SetGraphVisible { true }`.
+    pub graph: Option<graph::GraphPanel>,
+    pub graph_visible: bool,
+
+    /// The summon fade (spec §41). `true` means "on screen"; the interpolated
+    /// value is the card's opacity.
+    reveal: iced::Animation<bool>,
+    /// Frame time, from the `frames()` subscription. Held in state so `view`
+    /// stays a pure function of the model rather than reading the clock.
+    now: Instant,
+
+    // --- what is on screen -------------------------------------------------
+    pub state: DockState,
+    pub query: String,
+    pub answer: String,
+    pub status_line: String,
+    pub source: Option<Source>,
+    pub extra_sources: usize,
+    pub actions: Vec<ActionView>,
+    pub selected_action: Option<usize>,
+    /// The body currently holds a failure, not an answer. Not a `DockState` —
+    /// spec §4 has six states and this is a colour, not a seventh one — but
+    /// "the daemon broke" and "your notes do not say" must not look alike.
+    pub failed: bool,
+
+    /// The query currently on screen. Events for any other are discarded: an
+    /// abandoned query keeps streaming for a moment, and without this its tail
+    /// lands in the next answer.
+    current_query: Option<Uuid>,
+    history: keys::History,
+}
+
+impl Dock {
+    fn new() -> Self {
+        Self {
+            window: None,
+            x11: None,
+            geometry: DockGeometry::default(),
+            requests: None,
+            start_hidden: false,
+            restore_focus: true,
+            requested_height: tokens::INPUT_HEIGHT,
+            // Starts hidden and fades in on the first summon, whichever way the
+            // process was launched: an unmapped window has nothing to show, and
+            // a `--hidden`-less start is still an arrival.
+            reveal: iced::Animation::new(false).easing(iced::animation::Easing::EaseOut),
+            now: Instant::now(),
+            state: DockState::Input,
+            query: String::new(),
+            answer: String::new(),
+            status_line: String::new(),
+            source: None,
+            extra_sources: 0,
+            actions: Vec::new(),
+            selected_action: None,
+            failed: false,
+            graph: None,
+            graph_visible: false,
+            current_query: None,
+            history: keys::History::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        Self::new()
+    }
+
+    fn boot(args: &Args) -> (Self, Task<Message>) {
+        let dock = Self {
+            start_hidden: args.hidden,
+            restore_focus: args.restore_focus,
+            ..Self::new()
+        };
+
+        // Opened invisible either way; see the module comment.
+        let (_id, open) = iced::window::open(window_settings());
+
+        (dock, open.map(Message::WindowOpened))
+    }
+
+    fn subscription(&self) -> Subscription<Message> {
+        // Only while the card is actually fading. iced is event-driven, so a
+        // permanently subscribed `frames()` would hold the GPU at the refresh
+        // rate for a window that is resident from login and idle nearly all of
+        // it — the exact cost `PLAN.md` §2.5 asks the graph panel to avoid.
+        let animating = if self.reveal.is_animating(self.now) {
+            iced::window::frames().map(Message::Tick)
+        } else {
+            Subscription::none()
+        };
+
+        // Same rule as the fade: subscribe only while there is motion to show. A
+        // settled graph costs nothing, which is what makes a panel that can stay open
+        // all day acceptable in a process resident from login.
+        let simulating = match &self.graph {
+            Some(graph) if self.graph_visible && !graph.is_settled() => {
+                iced::window::frames().map(|_| Message::GraphTick)
+            }
+            _ => Subscription::none(),
+        };
+
+        Subscription::batch([
+            animating,
+            simulating,
+            ipc::connect().map(Message::Ipc),
+            // `listen_raw`, not `listen`: the text input captures most keys, and
+            // Esc / Ctrl+L / Alt+1 have to reach us anyway.
+            iced::event::listen_raw(|event, _status, _window| match event {
+                iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                    key, modifiers, ..
+                }) => shortcut(&key, modifiers),
+                _ => None,
+            }),
+            // A frameless dock has no close button, but a WM can still ask.
+            // Closing would destroy the window and with it the XID and every
+            // property on it, so this is always answered by hiding — and it is
+            // not `Dismiss`, which steps back through the UI states first.
+            iced::window::close_requests().map(|_id| Message::CloseRequested),
+        ])
+    }
+
+    /// Fold the message in, then reconcile the window with what that produced.
+    ///
+    /// The resize has to happen here rather than in `view`: iced never tells a
+    /// program how tall its view came out, so the window and the card are kept
+    /// in step by computing the height from the same state both are drawn from
+    /// (`layout::window_height`).
+    fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.dispatch(message);
+        Task::batch([task, self.fit_window()])
+    }
+
+    fn fit_window(&mut self) -> Task<Message> {
+        let Some(id) = self.window else {
+            return Task::none();
+        };
+
+        let height = layout::window_height(self);
+        // Sub-pixel differences are not worth a round trip, and comparing
+        // floats for equality would make every token batch a resize.
+        if (height - self.requested_height).abs() < 1.0 {
+            return Task::none();
+        }
+        self.requested_height = height;
+
+        // Only the width moves the anchored edge — height grows downward by
+        // design (spec §41) — so this is a no-op today and stays correct if the
+        // dock ever becomes width-adaptive.
+        if let Some(x11) = self.x11.as_mut()
+            && let Err(err) = x11.follow_resize(tokens::DOCK_WIDTH as u32)
+        {
+            tracing::error!("{err:#}");
+        }
+
+        iced::window::resize(id, iced::Size::new(tokens::DOCK_WIDTH, height))
+    }
+
+    fn dispatch(&mut self, message: Message) -> Task<Message> {
+        match message {
+            Message::WindowOpened(id) => {
+                self.window = Some(id);
+                iced::window::raw_id::<Message>(id).map(Message::Adopted)
+            }
+
+            Message::Adopted(raw) => {
+                match WindowController::adopt(raw, self.geometry) {
+                    Ok(mut controller) => {
+                        controller.set_restore_focus(self.restore_focus);
+                        self.x11 = Some(controller);
+                        // The window is created unmapped, so `--hidden` needs
+                        // nothing done to it. Anything else is an ordinary
+                        // summon, properties and all.
+                        if self.start_hidden {
+                            Task::none()
+                        } else {
+                            self.set_visible(true)
+                        }
+                    }
+                    Err(err) => {
+                        // Not fatal: an un-adopted window is an ordinary
+                        // floating window, which is ugly but usable, and saying
+                        // so beats exiting at login with no explanation.
+                        tracing::error!("{err:#}");
+                        Task::none()
+                    }
+                }
+            }
+
+            Message::Ipc(event) => self.on_ipc(event),
+
+            Message::QueryChanged(text) => {
+                self.query = text;
+                Task::none()
+            }
+
+            Message::Submit => self.submit(),
+
+            Message::Dismiss => {
+                // Esc walks back one step rather than hiding outright, and it
+                // never clears the answer — reopening a second later should
+                // show the previous result (spec §42).
+                match self.state {
+                    DockState::Answer | DockState::NoAnswer | DockState::Searching => {
+                        self.state = DockState::Input;
+                    }
+                    DockState::Input => {
+                        if !self.is_visible() {
+                            return Task::none();
+                        }
+                        // Tell the daemon, so its `visible` flag stays in step
+                        // and the next `brainctl toggle` does not try to hide an
+                        // already-hidden dock — but hide locally right now
+                        // rather than waiting out the round trip, which is
+                        // perceptible on a keypress that should feel instant.
+                        self.send(ClientRequest::Hide);
+                        return self.set_visible(false);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::Tick(now) => {
+                self.now = now;
+                Task::none()
+            }
+
+            Message::GraphTick => {
+                if let Some(graph) = self.graph.as_mut() {
+                    graph.tick();
+                }
+                Task::none()
+            }
+
+            Message::Graph(interaction) => {
+                let Some(graph) = self.graph.as_mut() else {
+                    return Task::none();
+                };
+                if let Some(section_uid) = graph.on_interaction(interaction) {
+                    // Jumping lands in Stage 3 with the rest of the actions; the uid is
+                    // logged now so the wiring is visible and the shape does not change
+                    // when it arrives.
+                    tracing::info!(%section_uid, "graph section activated");
+                }
+                Task::none()
+            }
+
+            Message::FadeOutElapsed => {
+                // The user may have re-summoned mid-fade, in which case the
+                // window is on its way back in and must not be unmapped.
+                if self.reveal.value() {
+                    tracing::debug!("re-summoned during the fade; staying up");
+                    return Task::none();
+                }
+                let Some(id) = self.window else {
+                    return Task::none();
+                };
+                iced::window::set_mode::<Message>(id, iced::window::Mode::Hidden)
+                    .chain(Task::done(Message::VisibilityChanged(false)))
+            }
+
+            Message::VisibilityChanged(visible) => {
+                if let Some(x11) = self.x11.as_mut() {
+                    let result = if visible {
+                        x11.finish_show()
+                    } else {
+                        x11.finish_hide()
+                    };
+                    if let Err(err) = result {
+                        tracing::error!("{err:#}");
+                    }
+                }
+
+                if visible {
+                    // Both of these need the window to be mapped already:
+                    // focusing an unmapped window is a no-op, and fading in one
+                    // shows nobody anything.
+                    self.animate_reveal(true);
+                    return iced::widget::operation::focus(view::query_input_id());
+                }
+                Task::none()
+            }
+
+            Message::CloseRequested => {
+                tracing::debug!("close requested; hiding instead");
+                self.send(ClientRequest::Hide);
+                self.set_visible(false)
+            }
+
+            Message::Command(command) => self.on_command(command),
+
+            Message::ActivateAction(index) => {
+                self.selected_action = Some(index);
+                // Targets land in Stage 3; the wiring is here so the UI does not
+                // change shape when they do.
+                tracing::info!(index, "action activated");
+                Task::none()
+            }
+        }
+    }
+
+    fn view(&self, _id: iced::window::Id) -> Element<'_, Message> {
+        view::view(self)
+    }
+
+    // -----------------------------------------------------------------------
+
+    fn on_ipc(&mut self, event: ipc::Event) -> Task<Message> {
+        match event {
+            ipc::Event::Connected(sender) => {
+                self.requests = Some(sender);
+                Task::none()
+            }
+            ipc::Event::Disconnected => {
+                self.requests = None;
+                Task::none()
+            }
+            ipc::Event::Tokens { id, text } => {
+                if self.current_query == Some(id) {
+                    self.answer.push_str(&text);
+                    self.state = DockState::Answer;
+                }
+                Task::none()
+            }
+            ipc::Event::Server(event) => self.on_server(*event),
+        }
+    }
+
+    fn on_server(&mut self, event: ServerEvent) -> Task<Message> {
+        // Discard stragglers from a query that is no longer on screen. Events
+        // with no query id (visibility, status) are always ours.
+        if let Some(id) = event.query_id()
+            && self.current_query != Some(id)
+        {
+            return Task::none();
+        }
+
+        match event {
+            // Focus is claimed in `VisibilityChanged`, once the window is
+            // actually mapped.
+            ServerEvent::ShowDock { context } => {
+                tracing::debug!(?context, "shown");
+                return self.set_visible(true);
+            }
+            ServerEvent::HideDock => return self.set_visible(false),
+
+            ServerEvent::SetGraphVisible { visible } => self.set_graph_visible(visible),
+
+            ServerEvent::RetrievalStarted { .. } => {
+                self.state = DockState::Searching;
+                self.status_line = String::from("searching…");
+            }
+            ServerEvent::RetrievalComplete { source_count, .. } => {
+                self.status_line = match source_count {
+                    0 => String::from("no sources"),
+                    1 => String::from("1 source"),
+                    n => format!("{n} sources"),
+                };
+            }
+            ServerEvent::Sources { items, .. } => self.set_sources(&items),
+            ServerEvent::Actions { items, .. } => {
+                self.selected_action = if items.is_empty() { None } else { Some(0) };
+                self.actions = items;
+            }
+            ServerEvent::GenerationStarted { .. } => {
+                self.answer.clear();
+                self.state = DockState::Answer;
+            }
+            ServerEvent::Complete { timing, .. } => {
+                self.state = DockState::Answer;
+                tracing::debug!(total_ms = timing.total_ms, "query complete");
+            }
+            ServerEvent::NoAnswer { closest, .. } => {
+                // A confident "not in your files" is a feature, not a failure
+                // (spec §45). The model was never called.
+                self.state = DockState::NoAnswer;
+                self.answer = String::from("I couldn't find a reliable answer in your notes.");
+                self.set_sources(&closest);
+            }
+            ServerEvent::Error { message, .. } => {
+                tracing::warn!(message, "daemon reported an error");
+                self.state = DockState::NoAnswer;
+                self.failed = true;
+                self.answer = message;
+            }
+
+            ServerEvent::QueryAccepted { .. }
+            | ServerEvent::Token { .. }
+            | ServerEvent::Status(_) => {}
+        }
+
+        Task::none()
+    }
+
+    fn set_sources(&mut self, items: &[SourceRef]) {
+        self.source = items.first().map(|first| Source {
+            path: first.path.display().to_string(),
+            heading: first.heading_path.clone(),
+            section_uid: first.section_uid.clone(),
+        });
+        self.extra_sources = items.len().saturating_sub(1);
+
+        // Re-seed the panel on whatever the answer is actually about. This is the whole
+        // point of the panel per `PLAN.md` §7 — the neighbourhood of the answer you are
+        // reading, not the vault as a bag of dots — and it is what makes it double as the
+        // Phase D retrieval debugger.
+        if let (Some(graph), Some(primary)) = (self.graph.as_mut(), items.first())
+            && !primary.section_uid.is_empty()
+        {
+            graph.focus_on(&primary.section_uid);
+        }
+    }
+
+    /// Open or close the graph panel.
+    ///
+    /// The first open pays for reading the vault and laying it out; later ones are free.
+    /// A failure to load is not fatal — the dock is still a dock — so it is reported and
+    /// the panel simply stays shut.
+    fn set_graph_visible(&mut self, visible: bool) {
+        self.graph_visible = visible;
+        if !visible {
+            return;
+        }
+
+        if self.graph.is_none() {
+            match ygraphy::vault::resolve(None).and_then(|vault| graph::GraphPanel::load(&vault)) {
+                Ok(panel) => self.graph = Some(panel),
+                Err(err) => {
+                    tracing::error!("could not open the graph: {err:#}");
+                    self.graph_visible = false;
+                    return;
+                }
+            }
+        }
+
+        // Opening onto the current answer's source, if there is one, rather than onto
+        // wherever the camera happened to be left.
+        if let (Some(graph), Some(source)) = (self.graph.as_mut(), self.source.as_ref()) {
+            let uid = source.section_uid.clone();
+            if !uid.is_empty() {
+                graph.focus_on(&uid);
+            }
+        }
+    }
+
+    fn submit(&mut self) -> Task<Message> {
+        let text = self.query.trim().to_string();
+        if text.is_empty() {
+            return Task::none();
+        }
+
+        self.history.push(&text);
+
+        // Abandon whatever is running. The daemon supersedes it anyway, but
+        // saying so explicitly means a slow query stops costing tokens the
+        // moment the user asks something else.
+        if let Some(previous) = self.current_query {
+            self.send(ClientRequest::Cancel { id: previous });
+        }
+
+        let id = Uuid::new_v4();
+        self.current_query = Some(id);
+        self.answer.clear();
+        self.source = None;
+        self.extra_sources = 0;
+        self.actions.clear();
+        self.selected_action = None;
+        self.failed = false;
+        self.state = DockState::Searching;
+        self.status_line = String::from("searching…");
+
+        self.send(ClientRequest::Query {
+            id,
+            text,
+            context: DesktopContext::default(),
+            retrieval_only: false,
+        });
+
+        Task::none()
+    }
+
+    fn on_command(&mut self, command: keys::Command) -> Task<Message> {
+        use keys::Command;
+
+        match command {
+            Command::ClearQuery => {
+                self.query.clear();
+                return iced::widget::operation::focus(view::query_input_id());
+            }
+            Command::CopyAnswer => {
+                if self.answer.is_empty() {
+                    return Task::none();
+                }
+                // iced's clipboard, not `arboard`: X11 selection ownership
+                // needs a live owner for as long as the paste might happen, and
+                // iced's runtime already holds one for the process lifetime.
+                tracing::info!(chars = self.answer.len(), "answer copied");
+                return iced::clipboard::write(self.answer.clone());
+            }
+            Command::HistoryPrevious => {
+                if let Some(entry) = self.history.previous(&self.query) {
+                    self.query = entry;
+                }
+            }
+            Command::HistoryNext => {
+                if let Some(entry) = self.history.next() {
+                    self.query = entry;
+                }
+            }
+            Command::SelectNextAction => self.move_selection(1),
+            Command::SelectPreviousAction => self.move_selection(-1),
+            Command::Activate(index) => {
+                if index < self.actions.len() {
+                    return self.dispatch(Message::ActivateAction(index));
+                }
+            }
+            Command::Retry => {
+                if !self.query.trim().is_empty() {
+                    return self.submit();
+                }
+            }
+            // Both need somewhere to put the result: the correction editor
+            // (Stage 6) and the sources panel (Stage 1).
+            Command::ShowSources | Command::EditAnswer => {
+                tracing::debug!(?command, "not wired yet");
+            }
+        }
+
+        Task::none()
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.actions.is_empty() {
+            return;
+        }
+        let count = self.actions.len() as isize;
+        let current = self.selected_action.unwrap_or(0) as isize;
+        let next = (current + delta).rem_euclid(count);
+        self.selected_action = Some(next as usize);
+    }
+
+    /// The card's opacity right now. Drives the summon fade in `view`.
+    pub fn opacity(&self) -> f32 {
+        self.reveal.interpolate(0.0, 1.0, self.now)
+    }
+
+    /// Whether the dock counts as on screen.
+    ///
+    /// A window that is mapped but already fading out does **not** — otherwise
+    /// a second `Esc` during the fade would send a second `Hide` and the next
+    /// `brainctl toggle` would show a dock the daemon believes is hidden.
+    fn is_visible(&self) -> bool {
+        self.reveal.value() && self.x11.as_ref().is_some_and(WindowController::is_visible)
+    }
+
+    /// Show or hide the dock.
+    ///
+    /// The map itself goes through iced (`Mode::Windowed` / `Mode::Hidden`),
+    /// not through `x11rb`. That is the Stage 0′ §0.0 Q1 primitive, and it is
+    /// also the only one that works: winit tracks its own visibility, and a
+    /// `MapWindow` sent behind its back is honoured by i3 and then withdrawn
+    /// again within the same second. `brain-x11` brackets the toolkit's map
+    /// with the parts iced has no API for — placement, stacking, focus.
+    ///
+    /// The fade sits on opposite sides of that map in each direction: show
+    /// maps first and fades in once there is a window to fade (the fade starts
+    /// in `VisibilityChanged`), hide fades first and unmaps after, or the card
+    /// would vanish instead of leaving.
+    fn set_visible(&mut self, visible: bool) -> Task<Message> {
+        let Some(id) = self.window else {
+            return Task::none();
+        };
+        tracing::debug!(visible, "setting dock visibility");
+
+        if visible {
+            if let Some(x11) = self.x11.as_mut()
+                && let Err(err) = x11.prepare_show(self.geometry.width)
+            {
+                tracing::error!("{err:#}");
+            }
+            iced::window::set_mode::<Message>(id, iced::window::Mode::Windowed)
+                .chain(Task::done(Message::VisibilityChanged(true)))
+        } else {
+            self.animate_reveal(false);
+            // Sleeping rather than waiting for the animation to report itself
+            // done: `frames()` stops arriving the moment the window stops being
+            // drawn, so an animation-driven completion could never fire.
+            Task::perform(tokio::time::sleep(tokens::HIDE), |()| {
+                Message::FadeOutElapsed
+            })
+        }
+    }
+
+    /// Start the fade towards `visible`.
+    ///
+    /// `Animation::duration` consumes the animation, and show and hide are
+    /// deliberately different lengths, so the animation is taken out and put
+    /// back rather than mutated in place.
+    fn animate_reveal(&mut self, visible: bool) {
+        let duration = if visible { tokens::SHOW } else { tokens::HIDE };
+        self.now = Instant::now();
+
+        let reveal = std::mem::replace(&mut self.reveal, iced::Animation::new(visible));
+        self.reveal = reveal.duration(duration).go(visible, self.now);
+    }
+
+    /// Fire-and-forget. A full or absent channel means the daemon is gone,
+    /// which the subscription is already handling — dropping the request is
+    /// better than blocking the UI on a socket.
+    fn send(&mut self, request: ClientRequest) {
+        let Some(sender) = self.requests.as_mut() else {
+            tracing::debug!("not connected; dropping request");
+            return;
+        };
+        if let Err(err) = sender.try_send(request) {
+            tracing::warn!(%err, "could not queue request");
+        }
+    }
+}
+
+/// Window settings proven by the Stage 0′ spike (`plan/01-stage-0-dock.md` §0.0).
+fn window_settings() -> iced::window::Settings {
+    iced::window::Settings {
+        size: iced::Size::new(tokens::DOCK_WIDTH, tokens::INPUT_HEIGHT),
+        decorations: false,
+        // Created unmapped, and mapped by `brain-x11` once the properties are
+        // on it. Two things depend on this. `_NET_WM_STATE` is ours to write
+        // directly only while unmapped — after the map the WM owns it and a
+        // plain `ChangeProperty` is ignored — and `raw_id` resolves *after*
+        // iced has mapped the window, so letting iced map it means every
+        // persistent property lands too late. It also removes the login flash
+        // that `--hidden` had to work around on Slint.
+        visible: false,
+        // A WM close request must hide the dock, not destroy the window: the
+        // XID and every property on it would go with it. `subscription`
+        // answers the request; iced must not act on it first.
+        exit_on_close_request: false,
+        // Needs a depth-32 ARGB visual, which is what lets picom draw the
+        // rounded corners and shadow. Verified: Q4.
+        transparent: true,
+        level: iced::window::Level::AlwaysOnTop,
+        platform_specific: iced::window::settings::PlatformSpecific {
+            // Sets *both* fields of WM_CLASS to this string, so the i3 rule is
+            // `for_window [class="brain-dock"]`. Verified: Q3.
+            application_id: String::from("brain-dock"),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// Map a key press to a named command, or to `Dismiss`.
+///
+/// Names rather than raw keys, so the binding table stays in `keys.rs` and
+/// becomes config-driven without touching this function's callers (spec §5).
+fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Message> {
+    use iced::keyboard::key::Named;
+
+    if let iced::keyboard::Key::Named(named) = key {
+        match named {
+            Named::Escape => return Some(Message::Dismiss),
+            Named::ArrowUp if !modifiers.command() => {
+                return command("history-previous");
+            }
+            Named::ArrowDown if !modifiers.command() => {
+                return command("history-next");
+            }
+            Named::Tab if modifiers.shift() => return command("action-previous"),
+            Named::Tab => return command("action-next"),
+            _ => return None,
+        }
+    }
+
+    let iced::keyboard::Key::Character(c) = key else {
+        return None;
+    };
+
+    if modifiers.command() {
+        return match c.as_str() {
+            "l" => command("clear"),
+            "c" => command("copy-answer"),
+            "s" => command("show-sources"),
+            _ => None,
+        };
+    }
+
+    if modifiers.alt() {
+        // `Alt+1..9`. One-based here because that is what the buttons show.
+        let digit: usize = c.parse().ok()?;
+        return command(&format!("action-{digit}"));
+    }
+
+    None
+}
+
+fn command(name: &str) -> Option<Message> {
+    keys::Command::parse(name).map(Message::Command)
 }

@@ -34,11 +34,37 @@ enum Command {
     },
     /// Print daemon diagnostics (spec §38).
     Status,
+    /// Walk the configured sources and bring the index up to date.
     Reindex,
     PauseIndexing,
     ResumeIndexing,
-    /// Check the environment: socket, compositor, openers, model.
+    /// List the configured sources and what they will index.
+    Sources,
+    /// Time retrieval over a set of queries and report p50/p99.
+    ///
+    /// The latency targets in the plan are unfalsifiable without this — on a five-row
+    /// fixture vault they pass regardless of what the code does.
+    Bench {
+        /// Queries to time. Defaults to a spread of shapes if none are given.
+        queries: Vec<String>,
+        /// Repetitions per query. The first run of each is discarded as a warm-up.
+        #[arg(long, default_value_t = 20)]
+        runs: usize,
+    },
+    /// Check the environment: config, socket, compositor, openers.
     Doctor,
+    /// The graph panel inside the dock.
+    #[command(subcommand)]
+    Graph(GraphCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum GraphCommand {
+    /// Show the graph panel if hidden, hide it if shown.
+    ///
+    /// The daemon owns the flag, exactly as it owns dock visibility — which is what keeps
+    /// this binary stateless and lets an i3 binding be a one-liner.
+    Toggle,
 }
 
 fn main() -> ExitCode {
@@ -65,8 +91,12 @@ fn main() -> ExitCode {
 }
 
 async fn run(command: Command) -> Result<()> {
-    if let Command::Doctor = command {
-        return doctor().await;
+    // Handled without the daemon: both read the same config file the daemon does, which is
+    // what lets `doctor` diagnose a config the daemon refused to start on.
+    match command {
+        Command::Doctor => return doctor().await,
+        Command::Sources => return print_sources(),
+        _ => {}
     }
 
     let mut connection = connect().await?;
@@ -75,6 +105,9 @@ async fn run(command: Command) -> Result<()> {
         Command::Toggle => connection.send(&ClientRequest::Toggle).await?,
         Command::Show => connection.send(&ClientRequest::Show).await?,
         Command::Hide => connection.send(&ClientRequest::Hide).await?,
+        Command::Graph(GraphCommand::Toggle) => {
+            connection.send(&ClientRequest::ToggleGraph).await?
+        }
         Command::PauseIndexing => connection.send(&ClientRequest::PauseIndexing).await?,
         Command::ResumeIndexing => connection.send(&ClientRequest::ResumeIndexing).await?,
 
@@ -84,7 +117,13 @@ async fn run(command: Command) -> Result<()> {
         }
         Command::Reindex => {
             connection.send(&ClientRequest::Reindex).await?;
-            return drain_until_complete(&mut connection).await;
+            // The daemon answers a reindex with a fresh `Status`, not a `Complete` —
+            // `Complete` belongs to queries. Printing the resulting counts is also the
+            // only way to see that the walk actually found anything.
+            return print_status(&mut connection).await;
+        }
+        Command::Bench { queries, runs } => {
+            return bench(&mut connection, queries, runs).await;
         }
         Command::Ask { query, no_llm } => {
             let text = query.join(" ");
@@ -99,7 +138,7 @@ async fn run(command: Command) -> Result<()> {
                 .await?;
             return stream_answer(&mut connection).await;
         }
-        Command::Doctor => unreachable!("handled above"),
+        Command::Doctor | Command::Sources => unreachable!("handled above"),
     }
 
     // Fire-and-forget commands still need the write to reach the kernel before
@@ -184,6 +223,12 @@ async fn stream_answer(connection: &mut ClientConnection) -> Result<()> {
                         source.start_line,
                         source.heading_path
                     );
+                    // Why this result, not just which. The debugger for graph retrieval:
+                    // when the wrong section comes back, this says whether the seed or the
+                    // expansion was at fault.
+                    if !source.explain.is_empty() {
+                        println!("    {}", source.explain);
+                    }
                 }
                 if !items.is_empty() {
                     println!();
@@ -219,15 +264,179 @@ async fn stream_answer(connection: &mut ClientConnection) -> Result<()> {
     anyhow::bail!("brain-daemon closed the connection before finishing")
 }
 
-async fn drain_until_complete(connection: &mut ClientConnection) -> Result<()> {
+/// Queries used when `bench` is given none.
+///
+/// Chosen for *shape* rather than for a particular vault: a natural question, a bare
+/// keyword pair, an identifier that only survives with `tokenchars`, and a query full of
+/// punctuation that would crash an unescaped `MATCH`.
+const DEFAULT_BENCH_QUERIES: &[&str] = &[
+    "how do I schedule a nightly backup?",
+    "systemd timer",
+    "calculate_pivot",
+    "what's the -j flag for?",
+];
+
+/// Time retrieval and report percentiles.
+///
+/// Retrieval only: generation is not wired yet, and mixing the two would report a number
+/// dominated by a stage that does not exist.
+async fn bench(connection: &mut ClientConnection, queries: Vec<String>, runs: usize) -> Result<()> {
+    anyhow::ensure!(runs > 1, "need at least 2 runs; the first is a warm-up");
+
+    let queries = if queries.is_empty() {
+        DEFAULT_BENCH_QUERIES
+            .iter()
+            .map(|q| (*q).to_string())
+            .collect()
+    } else {
+        queries
+    };
+
+    println!("{:<40} {:>7} {:>7} {:>7} {:>7}", "query", "n", "p50", "p99", "max");
+
+    let mut all = Vec::new();
+    for query in &queries {
+        let mut samples = Vec::with_capacity(runs);
+        let mut sources = 0;
+
+        for run in 0..runs {
+            let started = std::time::Instant::now();
+            connection
+                .send(&ClientRequest::Query {
+                    id: Uuid::new_v4(),
+                    text: query.clone(),
+                    context: Default::default(),
+                    retrieval_only: true,
+                })
+                .await?;
+
+            let found = wait_for_complete(connection).await?;
+            // Discard the first: it pays for the connection being cold and, on a fresh
+            // daemon, for the page cache. Reporting it would flatter or damn the run
+            // depending only on what ran before it.
+            if run > 0 {
+                samples.push(started.elapsed().as_secs_f64() * 1000.0);
+            }
+            sources = found;
+        }
+
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "{:<40} {:>7} {:>6.1}ms {:>6.1}ms {:>6.1}ms   ({sources} sources)",
+            truncate(query, 40),
+            samples.len(),
+            percentile(&samples, 0.50),
+            percentile(&samples, 0.99),
+            samples.last().copied().unwrap_or(0.0),
+        );
+        all.extend(samples);
+    }
+
+    all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "\noverall  p50 {:.1} ms   p99 {:.1} ms   over {} samples",
+        percentile(&all, 0.50),
+        percentile(&all, 0.99),
+        all.len()
+    );
+    // The plan's Stage 1 target, stated so the number has something to mean.
+    println!("target   end-to-end query → UI under 100 ms");
+    Ok(())
+}
+
+/// Wait for a query to finish, returning how many sources it produced.
+async fn wait_for_complete(connection: &mut ClientConnection) -> Result<usize> {
+    let mut sources = 0;
     while let Some(event) = connection.recv().await {
         match event? {
-            ServerEvent::Complete { .. } => return Ok(()),
+            ServerEvent::Sources { items, .. } => sources = items.len(),
+            ServerEvent::Complete { .. } => return Ok(sources),
             ServerEvent::Error { message, .. } => anyhow::bail!("{message}"),
             _ => {}
         }
     }
+    anyhow::bail!("brain-daemon closed the connection before finishing")
+}
+
+/// Nearest-rank percentile over a sorted slice.
+fn percentile(sorted: &[f64], quantile: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    let rank = (quantile * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{cut}…")
+}
+
+/// What the config says will be indexed.
+fn print_sources() -> Result<()> {
+    let config = load_config()?;
+
+    if config.sources.is_empty() {
+        println!("no [[sources]] configured");
+        return Ok(());
+    }
+
+    for source in &config.sources {
+        let kind = if source.vault { "vault" } else { "lexical" };
+        println!("{}  ({kind})", source.name);
+        println!("  path     {}", source.path.display());
+        println!("  include  {}", source.include.join(", "));
+        if !source.exclude.is_empty() {
+            println!("  exclude  {}", source.exclude.join(", "));
+        }
+        // Counting is what turns "I configured a source" into "the source has files in
+        // it" — a glob that matches nothing looks identical to a working one otherwise.
+        match count_matching(source) {
+            Ok(count) => println!("  files    {count}"),
+            Err(error) => println!("  files    unreadable: {error}"),
+        }
+        println!();
+    }
     Ok(())
+}
+
+/// Files a source would index, walking with its own globs.
+fn count_matching(source: &brain_core::Source) -> Result<usize> {
+    let matcher = source.matcher()?;
+    let mut count = 0;
+    let mut stack = vec![source.path.clone()];
+
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                // Prune excluded directories rather than walking into them: on a source
+                // pointed at a project tree, descending into `target/` is the difference
+                // between instant and a minute.
+                if matcher.accepts_directory(&path) {
+                    stack.push(path);
+                }
+            } else if matcher.accepts(&path) {
+                count += 1;
+            }
+        }
+    }
+    Ok(count)
+}
+
+fn load_config() -> Result<brain_core::Config> {
+    match std::env::var_os("BRAIN_CONFIG") {
+        Some(path) => brain_core::Config::load_from(std::path::Path::new(&path)),
+        None => brain_core::Config::load(),
+    }
+    .map_err(anyhow::Error::new)
+    .context("loading the configuration")
 }
 
 /// Environment checks that do not need the daemon.
@@ -265,17 +474,60 @@ async fn doctor() -> Result<()> {
          transparency, or shadow",
     );
 
-    for (binary, purpose) in [
-        ("nvim", "opening notes at a line"),
-        ("ghostty", "hosting the editor"),
-        ("xdg-open", "opening urls"),
-        ("gtk-launch", "launching desktop applications"),
-    ] {
-        check(
-            &format!("{binary} on PATH"),
-            which(binary),
-            &format!("needed for {purpose}"),
-        );
+    // The config is checked here rather than only at daemon startup, because a daemon that
+    // refused to start is exactly when someone runs `doctor` — and it should say why.
+    match load_config() {
+        Ok(config) => {
+            check("configuration loads", true, "");
+
+            for source in &config.sources {
+                let readable = source.path.is_dir();
+                check(
+                    &format!("source {:?} readable", source.name),
+                    readable,
+                    &format!("{} is not a directory", source.path.display()),
+                );
+                if readable {
+                    match count_matching(source) {
+                        // A source whose globs match nothing looks identical to a working
+                        // one until a query comes back empty.
+                        Ok(0) => check(
+                            &format!("source {:?} matches files", source.name),
+                            false,
+                            "the include globs match nothing in that directory",
+                        ),
+                        Ok(count) => {
+                            println!("ok    source {:?} matches {count} files", source.name);
+                            // Spec §29: a source this size is almost always a mistake.
+                            if count > 50_000 {
+                                println!(
+                                    "warn  source {:?} would index {count} files; \
+                                     narrow it with include/exclude",
+                                    source.name
+                                );
+                            }
+                        }
+                        Err(error) => check(
+                            &format!("source {:?} walkable", source.name),
+                            false,
+                            &error.to_string(),
+                        ),
+                    }
+                }
+            }
+
+            // Check the openers actually configured, not a hardcoded list — a config
+            // pointing at `kitty` should not fail because `ghostty` is missing.
+            for (name, template) in brain_engine::actions::all_openers(&config.openers) {
+                let program = template.first().cloned().unwrap_or_default();
+                check(
+                    &format!("opener {name} ({program})"),
+                    brain_engine::actions::opener_is_installed(template),
+                    &format!("{program} is not on PATH; fix [openers] {name}"),
+                );
+            }
+        }
+        Err(error) => check("configuration loads", false, &format!("{error:#}")),
     }
 
     if problems == 0 {
@@ -284,14 +536,6 @@ async fn doctor() -> Result<()> {
     } else {
         anyhow::bail!("{problems} check(s) failed")
     }
-}
-
-fn which(binary: &str) -> bool {
-    std::env::var_os("PATH")
-        .map(|path| {
-            std::env::split_paths(&path).any(|dir| dir.join(binary).is_file())
-        })
-        .unwrap_or(false)
 }
 
 fn is_running(process: &str) -> bool {

@@ -1,6 +1,7 @@
 //! Keyboard actions.
 //!
-//! The `.slint` side reports *named* shortcuts rather than raw keys, so the
+//! Toolkit-independent by design, and it carried across the iced port
+//! unchanged. The view reports *named* shortcuts rather than raw keys, so the
 //! binding table lives here in one place. Spec §5 says these must be
 //! configurable; parsing names from config is a small change on top of this,
 //! and none of the call sites move when it happens.
@@ -189,6 +190,9 @@ mod tests {
         }
         assert_eq!(history.entries.len(), MAX_ENTRIES);
         // The oldest entries were dropped, not the newest.
-        assert_eq!(history.previous(""), Some(format!("query {}", MAX_ENTRIES + 49)));
+        assert_eq!(
+            history.previous(""),
+            Some(format!("query {}", MAX_ENTRIES + 49))
+        );
     }
 }

@@ -17,6 +17,11 @@ brain-index = { path = "crates/brain-index" }
 brain-engine = { path = "crates/brain-engine" }
 brain-x11 = { path = "crates/brain-x11" }
 
+# The vault engine: schema, parser, section identity, and the shared graph.
+# `yy` is a separate workspace inside the same repository, so this reaches up one level.
+# PLAN.md §2.2 decision A — one parser, one `section_uid`, one graph.
+yalive = { path = ".." }
+
 # async / runtime
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -40,18 +45,25 @@ uuid = { version = "1", features = ["v4", "serde"] }
 etcetera = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 
+# indexing
+# `globset` compiles the include/exclude patterns from config; `notify` plus the
+# debouncer is what turns nvim's atomic-save rename pair into one event instead of a
+# delete followed by a create (Stage 1 §1.5).
+globset = "0.4"
+notify = "8"
+notify-debouncer-full = "0.6"
+
 # ui
 #
-# `unstable-winit-030` gives us BackendSelector::with_winit_window_attributes_hook,
-# the only way to set WM_CLASS *before* the window is first mapped — and i3's
-# `for_window` rules are evaluated at map time, so anything later is too late.
+# iced 0.14 pins wgpu 27, winit 0.30, raw-window-handle 0.6. yGraphy must match that
+# wgpu version when the graph panel lands (PLAN.md §7.2) — note that no glyphon release
+# targets wgpu 27, which is why the panel renders labels as iced widgets instead.
 #
-# `raw-window-handle-06` exposes the XID that brain-x11 drives.
-#
-# Both are explicitly unstable across minor Slint releases. If a bump breaks
-# them, the fallback is documented in plan/01-stage-0-dock.md §0.3.
-slint = { version = "1.17", features = ["unstable-winit-030", "raw-window-handle-06"] }
-slint-build = "1.17"
+# `wgpu`     — the iced_wgpu renderer, and what `widget::shader` needs.
+# `advanced` — custom widgets and the shader widget's Program/Primitive traits.
+# `tokio`    — makes iced's executor the same runtime brain-proto expects, so the daemon
+#              connection can be an ordinary Subscription instead of a bridged thread.
+iced = { version = "0.14", features = ["wgpu", "advanced", "tokio"] }
 
 # x11
 x11rb = { version = "0.14", features = ["randr"] }
@@ -60,7 +72,7 @@ raw-window-handle = "0.6"
 # dev
 tempfile = "3"
 
-# Slint and its renderer are unusably slow in an unoptimised debug build, and
+# wgpu and the text-shaping stack are unusably slow in an unoptimised debug build, and
 # Stage 0 is nothing but iterating on UI feel. Build our own crates lightly and
 # every dependency at full speed.
 [profile.dev]

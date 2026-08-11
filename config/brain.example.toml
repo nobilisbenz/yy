@@ -26,7 +26,7 @@ restore_previous_focus = true
 
 # UI scale. 1.0 matches an unscaled 96 DPI X session. winit guesses 1.5 on some
 # laptop panels with no Xft.dpi set, which renders the dock half again larger
-# than every other window; this pins both SLINT_SCALE_FACTOR and
+# than every other window; this pins both the iced scale factor and
 # WINIT_X11_SCALE_FACTOR. Raise it on a genuinely HiDPI display.
 scale = 1.0
 
@@ -47,11 +47,22 @@ lexical_limit = 30
 fused_limit = 20
 context_sections = 5
 
-# bm25() column weights: heading, heading_path, body. Heading matches carry
-# most of the retrieval signal in a notes corpus, hence the 8x.
+# bm25() column weights, in the column order `section_search` declares. Heading
+# matches carry most of the retrieval signal in a notes corpus, hence the 8x.
+bm25_note_title = 3.0
 bm25_heading = 8.0
 bm25_heading_path = 4.0
 bm25_body = 1.0
+bm25_tags = 2.0
+
+# Graph expansion over `relations` (PLAN.md §2.3). Seeds come from the lexical
+# hits above; expansion reaches backlinks as well as forward links.
+[search.graph]
+enabled = true
+max_hops = 2
+seed_count = 5
+hop_decay = 0.6
+min_weight = 0.1
 
 # Ranking multipliers for front-matter `status:` (spec §47). Strongly penalise
 # superseded workflows so old and new do not blend together in one answer.
@@ -75,6 +86,10 @@ path = "~/brain"
 include = ["**/*.md", "**/*.txt"]
 # `.notes/` is another tool's sidecar index; it is not prose.
 exclude = ["**/.git/**", "**/.notes/**"]
+# A vault is read through `yalive`, so its sections carry a `section_uid` and take
+# part in graph expansion and review-state ranking. Non-vault sources are plain
+# lexical matches (PLAN.md §2.2).
+vault = true
 
 # [[sources]]
 # name = "code"
@@ -87,6 +102,8 @@ markdown = ["ghostty", "-e", "nvim", "+{line}", "{path}"]
 text = ["ghostty", "-e", "nvim", "+{line}", "{path}"]
 directory = ["xdg-open", "{path}"]
 url = ["xdg-open", "{url}"]
+# {seconds} is substituted for a video timestamp action (Stage 3).
+video = ["xdg-open", "{url}"]
 
 # ---------------------------------------------------------------------------
 # Stage 2

@@ -5,16 +5,21 @@
 //! require loading a model (spec §3.1), which is the entire reason this process
 //! is separate from the UI.
 
+mod backend;
 mod listener;
 mod mock;
 mod session;
 mod state;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use brain_core::Config;
 use clap::Parser;
 
+use crate::backend::Backend;
+use crate::session::Services;
 use crate::state::Daemon;
 
 #[derive(Parser, Debug)]
@@ -24,6 +29,10 @@ struct Args {
     /// generating. Keeps UI timing work possible with no model loaded.
     #[arg(long)]
     mock: bool,
+
+    /// Config file. Defaults to `$XDG_CONFIG_HOME/brain/config.toml`.
+    #[arg(long, env = "BRAIN_CONFIG")]
+    config: Option<PathBuf>,
 
     /// Log filter, e.g. `debug` or `brain_daemon=trace,info`.
     #[arg(long, env = "BRAIN_LOG", default_value = "info")]
@@ -39,13 +48,43 @@ async fn main() -> Result<()> {
     let listener = listener::bind(&path).await?;
 
     let daemon = Arc::new(Daemon::new());
+    let backend = if args.mock {
+        None
+    } else {
+        Some(Arc::new(open_backend(args.config.as_deref())?))
+    };
+
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         mock = args.mock,
         "brain-daemon ready"
     );
 
-    let result = serve(listener, Arc::clone(&daemon), args.mock).await;
+    // Index in the background. Blocking startup on a vault walk would mean the dock cannot
+    // be summoned until it finishes, which is the one thing the split process exists to
+    // prevent (spec §3.1).
+    if let Some(backend) = backend.clone() {
+        let daemon = Arc::clone(&daemon);
+        tokio::spawn(async move {
+            match backend.reindex().await {
+                Ok(stats) => {
+                    daemon.record_counts(stats);
+                    tracing::info!(
+                        documents = stats.documents,
+                        sections = stats.sections,
+                        "initial index ready"
+                    );
+                }
+                Err(error) => tracing::error!(%error, "the initial index failed"),
+            }
+        });
+    }
+
+    let services = Arc::new(Services {
+        daemon: Arc::clone(&daemon),
+        backend,
+    });
+    let result = serve(listener, services).await;
 
     // A socket file outliving its daemon is exactly the stale-socket case the
     // listener has to reason about on next start. Clean up after ourselves so
@@ -56,18 +95,32 @@ async fn main() -> Result<()> {
     result
 }
 
-async fn serve(
-    listener: tokio::net::UnixListener,
-    daemon: Arc<Daemon>,
-    mock: bool,
-) -> Result<()> {
+/// Load the config and open the vault behind it.
+///
+/// A config problem is fatal here rather than degraded-to-defaults: defaults index nothing,
+/// so a daemon that "started fine" would answer every question with silence.
+fn open_backend(config_path: Option<&std::path::Path>) -> Result<Backend> {
+    let config = match config_path {
+        Some(path) => Config::load_from(path),
+        None => Config::load(),
+    }
+    .context("loading the configuration")?;
+
+    tracing::info!(
+        sources = config.sources.len(),
+        "configuration loaded"
+    );
+    Backend::open(config)
+}
+
+async fn serve(listener: tokio::net::UnixListener, services: Arc<Services>) -> Result<()> {
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, _) = accepted.context("accepting a control connection")?;
-                let daemon = Arc::clone(&daemon);
+                let services = Arc::clone(&services);
                 tokio::spawn(async move {
-                    if let Err(err) = session::run(stream, daemon, mock).await {
+                    if let Err(err) = session::run(stream, services).await {
                         tracing::debug!(%err, "control connection ended");
                     }
                 });

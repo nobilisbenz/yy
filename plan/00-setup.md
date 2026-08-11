@@ -9,7 +9,7 @@ Vulkan path.
 ## 1. System packages
 
 Already present: `cmake`, `gcc/g++`, `git`, `pkg-config`, `sqlite3`, `xdotool`, `xprop`,
-`gtk-launch`, `nvim`, `ghostty`, `picom`, and the X11/font dev headers Slint needs
+`gtk-launch`, `nvim`, `ghostty`, `picom`, and the X11/font dev headers iced needs
 (`libxkbcommon-dev`, `libxcb1-dev`, `libfontconfig-dev`, `libfreetype-dev`,
 `libxrandr-dev`, `libssl-dev`).
 
@@ -29,7 +29,8 @@ sudo apt install -y \
 
 - `ninja-build` — llama.cpp builds much faster with it.
 - `libclang-dev` — needed by `bindgen`, pulled in transitively by several crates.
-- `libgl1-mesa-dev` — Slint's femtovg renderer needs a GL dev target.
+- `libgl1-mesa-dev` — GL/Mesa dev target. `iced_wgpu` prefers **Vulkan** on this box, so
+  confirm `mesa-vulkan-drivers` and `vulkan-tools` are installed as well.
 - `wmctrl`, `jq`, `curl` — debugging only (`wmctrl -lx` to inspect WM_CLASS, `curl` to poke llama-server).
 
 ---
@@ -183,7 +184,7 @@ shadow = false;
 
 rules = (
   {
-    match = "class_g = 'BrainDock'";
+    match = "class_g = 'brain-dock'";
     corner-radius = 22;
     shadow = true;
     shadow-radius = 28;
@@ -219,8 +220,8 @@ matter once binaries exist.
 
 ```i3
 # --- Brain Dock ---
-for_window [class="BrainDock"] floating enable, border pixel 0, sticky enable
-no_focus  [class="BrainDock" window_role="none"]
+for_window [class="brain-dock"] floating enable, border pixel 0, sticky enable
+no_focus  [class="brain-dock" window_role="none"]
 
 exec --no-startup-id brain-daemon
 exec --no-startup-id brain-dock --hidden

@@ -47,7 +47,7 @@ mkdir -p crates ui/components migrations config scripts tests/fixtures benchmark
 ```
 
 Root `Cargo.toml` per [`README.md`](README.md#repository-layout), with the dev-profile
-override that keeps Slint usable:
+override that keeps the wgpu/text stack usable in debug:
 
 ```toml
 [profile.dev]
@@ -78,8 +78,8 @@ Deps: `serde`, `serde_json`, `uuid`, `tokio`, `tokio-util` (`codec` feature), `t
 `ServerEvent::Error{ "not implemented" }` except `Status`. `brainctl` connects, sends one
 request, prints the reply, exits non-zero if the socket is missing.
 
-This is the smallest end-to-end IPC proof and it takes an hour. Do it before touching
-Slint, so that when the UI misbehaves you already know the transport works.
+This is the smallest end-to-end IPC proof and it takes an hour. Do it before touching the
+UI, so that when the UI misbehaves you already know the transport works.
 
 Deps (daemon): `tokio`, `tracing`, `tracing-subscriber`, `anyhow`.
 
@@ -93,25 +93,26 @@ kill %1; cargo run -p brainctl -- status # exits non-zero with a clear message
 
 ### C4 — `brain-dock` window, on screen, ugly
 
-Minimum Slint: a `Window` with a text input and nothing else. No IPC, no positioning, no
-X11 properties. Get it to appear.
+Minimum iced: `iced::daemon()`, one `window::open`, a `text_input` and nothing else. No
+IPC, no positioning, no X11 properties. Get it to appear.
 
-Deps: `slint` (build-dep `slint-build`), `ui/dock.slint`, `ui/tokens.slint`.
+Deps: `iced = { version = "0.14", features = ["wgpu", "advanced", "tokio"] }`,
+`ui/dock.rs`, `ui/tokens.rs`.
 
 **Verify:** `cargo run -p brain-dock` shows a window and accepts typing.
 
 ### C5 — WM_CLASS and i3 rules
 
-Set `WM_CLASS` to `brain-dock` / `BrainDock` **before first map** (winit attributes hook;
-fallback in Stage 0 §0.3). This is the commit where the i3 rules already in your config
-start applying.
+Set `WM_CLASS` to `brain-dock` **before first map** via
+`window::Settings.platform_specific.application_id` (fallback in Stage 0 §0.3). This is the
+commit where the i3 rules already in your config start applying.
 
 **Verify:**
 
 ```bash
-xprop -name "Brain Dock" WM_CLASS        # "brain-dock", "BrainDock"
-wmctrl -lx | grep BrainDock
-i3-msg -t get_tree | jq '.. | select(.window_properties?.class? == "BrainDock")
+xprop -name "Brain Dock" WM_CLASS        # "brain-dock", "brain-dock"
+wmctrl -lx | grep brain-dock
+i3-msg -t get_tree | jq '.. | select(.window_properties?.class? == "brain-dock")
                           | {floating, border, sticky}'
 ```
 
@@ -121,7 +122,8 @@ Floating, border 0, sticky — all from the config, no code.
 
 The core of the stage. EWMH atoms, `_NET_WM_STATE` (above/sticky/skip-taskbar/skip-pager),
 `_NET_WM_WINDOW_TYPE_UTILITY`, `_MOTIF_WM_HINTS`, `_NET_WORKAREA` anchoring,
-`MapWindow`/`UnmapWindow`, `_NET_ACTIVE_WINDOW` focus request, and the RandR monitor pick.
+`_NET_ACTIVE_WINDOW` focus request, the RandR monitor pick, and — if Stage 0 §0.0 answer 1
+says `Mode::Hidden` is not usable — `MapWindow`/`UnmapWindow`.
 
 Deps: `x11rb` (`randr`), `raw-window-handle`.
 
@@ -138,9 +140,9 @@ Daemon owns `visible: bool`; `brainctl toggle` flips it; the daemon sends
 `ShowDock`/`HideDock` to the subscribed UI connection. Dock's tokio thread reconnects with
 backoff if the daemon is not up yet.
 
-This is where the Slint/tokio threading model from Stage 0 §0.4 gets built — main thread
-runs `ui.run()`, background thread runs the runtime, backend→UI goes through
-`slint::invoke_from_event_loop`.
+This is where the iced runtime model from Stage 0 §0.4 gets built — `iced::daemon()` owns
+the loop, the daemon connection is a `Subscription` yielding `Message::Server(..)`, and
+`update()` folds events into state. No cross-thread UI handles.
 
 **Verify:** `$mod+a` from i3 toggles the dock. Restart the daemon while the dock is
 running; the dock reconnects on its own.
@@ -157,7 +159,7 @@ the start.
 ### C9 — polish and lock the stage
 
 Keyboard map struct (`Enter`, `Esc`, `Ctrl+L`, `Ctrl+C`, `Up`/`Down`), show/hide
-animations, `tokens.slint` holding every visual constant, `brainctl doctor` checking the
+animations, `tokens.rs` holding every visual constant, `brainctl doctor` checking the
 compositor and socket.
 
 **Verify:** the full Stage 0 definition-of-done checklist.
@@ -168,12 +170,17 @@ compositor and socket.
 
 C6 is the risky one, so front-load its two unknowns before writing the rest of it:
 
-1. **Does transparency work?** Set `background: transparent` on the Slint `Window`, request
-   a transparent winit window, run with picom active. Half an hour. If it fails, take the
-   opaque fallback immediately and move on — do not spend a day on it.
-2. **Does map/unmap survive?** Unmap and remap the window ten times and confirm the XID,
-   the EWMH properties, and the Slint rendering all survive. If Slint's renderer objects to
-   being unmapped, fall back to moving the window off-screen instead, and note it.
+1. **Does transparency work?** `window::Settings { transparent: true, .. }` plus an alpha
+   background in the theme, with picom active. Half an hour. It worked on Slint's GL path;
+   `iced_wgpu` goes through Vulkan, so re-prove it. If it fails, take the opaque fallback
+   immediately and move on — do not spend a day on it.
+2. **Does hide/show survive?** Round-trip `Mode::Hidden` ⇄ `Mode::Windowed` ten times and
+   confirm the XID, the EWMH properties, and the wgpu surface all survive — Slint's
+   `hide()` destroyed the window, which is why this is a question at all. If iced does the
+   same, fall back to `x11rb` map/unmap on the raw XID (already in `brain-x11`).
+
+Both are covered in more detail by Stage 0 §0.0, which adds `WM_CLASS` and the 50 ms
+round-trip measurement. Run that spike; these two are its first half.
 
 Both answers change the shape of the code, so get them before writing the code.
 

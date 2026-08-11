@@ -12,6 +12,7 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
+use brain_index::IndexStats;
 use brain_proto::{ServerEvent, StatusReport, TimingInfo};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -33,10 +34,16 @@ struct Ui {
 
 struct Inner {
     visible: bool,
+    graph_visible: bool,
     ui: Option<Ui>,
     next_ui_token: u64,
     indexing_paused: bool,
     last_query: Option<TimingInfo>,
+    /// Last counts read from the index. Cached because `status` is synchronous and
+    /// reaching the index is not — the writer thread may be mid-reindex, and blocking the
+    /// status call behind a vault walk would make `brainctl status` hang exactly when it
+    /// is most likely to be asked.
+    counts: IndexStats,
 }
 
 pub struct Daemon {
@@ -50,10 +57,12 @@ impl Daemon {
             started: Instant::now(),
             inner: Mutex::new(Inner {
                 visible: false,
+                graph_visible: false,
                 ui: None,
                 next_ui_token: 1,
                 indexing_paused: false,
                 last_query: None,
+                counts: IndexStats::default(),
             }),
         }
     }
@@ -76,11 +85,18 @@ impl Daemon {
         // A reconnecting dock does not know whether it should be on screen.
         // Tell it, so a daemon restart cannot leave the two disagreeing.
         let visible = inner.visible;
+        let graph_visible = inner.graph_visible;
         drop(inner);
         if visible {
             self.send_to_ui(ServerEvent::ShowDock {
                 context: Default::default(),
             });
+        }
+        // Replayed only when open, exactly like `ShowDock`. A dock that restarts with
+        // the panel open should come back with it open; a fresh dock already defaults to
+        // closed, so saying so would be a redundant event on every single connect.
+        if graph_visible {
+            self.send_to_ui(ServerEvent::SetGraphVisible { visible: true });
         }
 
         token
@@ -141,14 +157,35 @@ impl Daemon {
         }
     }
 
+    /// Flip the graph panel, and tell the dock. Returns the new state.
+    ///
+    /// Deliberately independent of dock visibility: the panel is a mode the user is in,
+    /// not part of a summon, so dismissing the dock and bringing it back should find the
+    /// graph where they left it.
+    pub fn toggle_graph(&self) -> bool {
+        let visible = {
+            let mut inner = self.lock();
+            inner.graph_visible = !inner.graph_visible;
+            inner.graph_visible
+        };
+
+        if !self.send_to_ui(ServerEvent::SetGraphVisible { visible }) {
+            tracing::warn!("graph visibility changed but no dock is connected");
+        }
+        visible
+    }
+
     pub fn set_indexing_paused(&self, paused: bool) {
         self.lock().indexing_paused = paused;
     }
 
-    /// Wired up in Stage 2, when there is a query pipeline to time.
-    #[allow(dead_code)]
     pub fn record_query(&self, timing: TimingInfo) {
         self.lock().last_query = Some(timing);
+    }
+
+    /// Publish fresh index counts, so `status` can stay synchronous.
+    pub fn record_counts(&self, counts: IndexStats) {
+        self.lock().counts = counts;
     }
 
     pub fn status(&self) -> StatusReport {
@@ -161,11 +198,11 @@ impl Daemon {
             llm_backend: None,
             llm_state: "not configured".to_string(),
             llm_context_tokens: None,
-            // Populated in Stage 1.
-            indexed_documents: 0,
-            indexed_sections: 0,
+            indexed_documents: inner.counts.documents as u64,
+            indexed_sections: inner.counts.sections as u64,
+            // Stage 5, if the benchmark ever justifies embeddings at all.
             embedding_queue: 0,
-            index_generation: 0,
+            index_generation: inner.counts.generation,
             indexing_paused: inner.indexing_paused,
             ui_connected: inner.ui.is_some(),
             dock_visible: inner.visible,
@@ -246,6 +283,50 @@ mod tests {
         let (tx2, mut rx2) = unbounded_channel();
         daemon.register_ui(tx2);
         assert!(matches!(rx2.try_recv(), Ok(ServerEvent::ShowDock { .. })));
+    }
+
+    #[test]
+    fn the_graph_panel_toggles_independently_of_the_dock() {
+        let daemon = Daemon::new();
+        let (tx, mut rx) = unbounded_channel();
+        daemon.register_ui(tx);
+
+        assert!(daemon.toggle_graph(), "first toggle opens it");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerEvent::SetGraphVisible { visible: true })
+        ));
+
+        // Dismissing the dock must not close the panel: it is a mode the user is in,
+        // not part of a summon.
+        daemon.set_visible(true);
+        daemon.set_visible(false);
+        assert!(daemon.lock().graph_visible, "hiding the dock closed the graph");
+
+        assert!(!daemon.toggle_graph(), "second toggle closes it");
+    }
+
+    #[test]
+    fn a_reconnecting_dock_is_told_about_an_open_graph_but_not_a_closed_one() {
+        let daemon = Daemon::new();
+        let (tx, _rx) = unbounded_channel();
+        let token = daemon.register_ui(tx);
+
+        // Closed: a fresh dock already defaults to closed, so there is nothing to say.
+        let (tx2, mut rx2) = unbounded_channel();
+        daemon.register_ui(tx2);
+        assert!(rx2.try_recv().is_err());
+
+        daemon.unregister_ui(token);
+        daemon.toggle_graph();
+
+        // Open: the dock has no way to know, so it must be told.
+        let (tx3, mut rx3) = unbounded_channel();
+        daemon.register_ui(tx3);
+        assert!(matches!(
+            rx3.try_recv(),
+            Ok(ServerEvent::SetGraphVisible { visible: true })
+        ));
     }
 
     #[test]

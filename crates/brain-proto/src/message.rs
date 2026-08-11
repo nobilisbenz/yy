@@ -39,10 +39,25 @@ pub enum ClientRequest {
     /// Abandon a running query. Idempotent; unknown ids are ignored.
     Cancel { id: Uuid },
 
+    /// Run one of the actions the daemon offered for a query.
+    ///
+    /// The dock sends the action's id, never a command. The daemon resolves it against the
+    /// actions it built from *parsed vault metadata* — which is what structurally enforces
+    /// spec §48: there is no path by which model output becomes something that executes.
+    ActivateAction {
+        id: Uuid,
+        action: brain_core::ActionId,
+    },
+
     /// Visibility. The daemon resolves `Toggle` against its own state.
     Toggle,
     Show,
     Hide,
+
+    /// The graph panel's visibility, resolved by the daemon the same way. Keeping it
+    /// here rather than in the dock is what lets `brainctl graph toggle` stay a stateless
+    /// one-shot binary that knows nothing about windows.
+    ToggleGraph,
 
     /// Sent once by `brain-dock` to register as *the* UI connection.
     Subscribe,
@@ -108,6 +123,13 @@ pub enum ServerEvent {
     },
 
     /// daemon → dock only.
+    /// Show or hide the graph panel inside the dock.
+    ///
+    /// Separate from `ShowDock`: the panel's visibility outlives any single summon, so
+    /// hiding the dock must not silently close the graph as well.
+    SetGraphVisible {
+        visible: bool,
+    },
     ShowDock {
         context: DesktopContext,
     },
@@ -131,7 +153,10 @@ impl ServerEvent {
             | Self::Complete { id, .. }
             | Self::NoAnswer { id, .. } => Some(*id),
             Self::Error { id, .. } => *id,
-            Self::ShowDock { .. } | Self::HideDock | Self::Status(_) => None,
+            Self::ShowDock { .. }
+            | Self::HideDock
+            | Self::SetGraphVisible { .. }
+            | Self::Status(_) => None,
         }
     }
 }
@@ -169,6 +194,14 @@ impl DesktopContext {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SourceRef {
     pub section_id: SectionId,
+    /// The identity `yalive`, `yGraphy`, and `yReviewy` all share — `note#section`.
+    ///
+    /// Carried alongside the rowid because the rowid is local to one database, and this
+    /// is what `relations`, `cards`, and `review_state` hang off. It is what the graph
+    /// panel seeds on and what a `Show in graph` action would send. Empty for non-vault
+    /// sources (code, PDFs), which have no section identity at all.
+    #[serde(default)]
+    pub section_uid: String,
     pub path: PathBuf,
     /// `OBS workflows > Follow cursor > Smoothing`
     pub heading_path: String,
@@ -179,6 +212,13 @@ pub struct SourceRef {
     pub score: f32,
     /// First lines of the section, for the expanded source list.
     pub snippet: String,
+    /// Why this section was retrieved — `matched heading · 1 hop to contradicts`.
+    ///
+    /// Shown as one line under the source badge. It is a user-facing feature and the
+    /// debugger for graph retrieval out of the same implementation: when the wrong section
+    /// comes back, this says whether the seed or the expansion was at fault.
+    #[serde(default)]
+    pub explain: String,
 }
 
 /// A trusted jump target. Always built by application code from parsed
@@ -293,12 +333,14 @@ mod tests {
         let id = Uuid::new_v4();
         let source = SourceRef {
             section_id: SectionId(3),
+            section_uid: "obs#smoothing".into(),
             path: PathBuf::from("/home/nabi/brain/obs.md"),
             heading_path: "OBS > Follow cursor > Smoothing".into(),
             start_line: 12,
             end_line: 18,
             score: -8.42,
             snippet: "Apply exponential smoothing…".into(),
+            explain: "matched heading".into(),
         };
         let action = ActionView {
             id: ActionId(1),

@@ -5,18 +5,24 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+# The dock window, on iced 0.14. Replaced the Slint build once it reached the
+# Stage 0 definition of done; that version is in git history at 44c50ad if any
+# of it is ever wanted back.
+
+[[bin]]
+name = "brain-dock"
+path = "src/main.rs"
+
 [dependencies]
 brain-proto = { workspace = true }
 brain-x11 = { workspace = true }
+# The graph panel is an `iced::widget::shader` program that `ygraphy` provides, so
+# embedding it is an ordinary dependency rather than an embedding problem (PLAN.md §7.1).
+ygraphy = { path = "../../../yGraphy" }
 anyhow = { workspace = true }
 clap = { workspace = true }
-slint = { workspace = true }
+iced = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-raw-window-handle = "0.6"
 uuid = { version = "1", features = ["v4"] }
-arboard = "3"
-
-[build-dependencies]
-slint-build = { workspace = true }

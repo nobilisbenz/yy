@@ -38,7 +38,7 @@ everything after that as optional increments, each independently shippable.
 | — | [`00b-machine-baseline.md`](00b-machine-baseline.md) | **Verified machine state + measured numbers. Read this first.** |
 | — | [`10-kickoff.md`](10-kickoff.md) | **The first coding session, commit by commit** |
 | 0 | [`01-stage-0-dock.md`](01-stage-0-dock.md) | ✅ **done** — `$mod+a` shows a focused, floating, top-right dock with a streamed mock answer |
-| 1 | [`02-stage-1-index-search.md`](02-stage-1-index-search.md) | Type a question, jump to the right Markdown section in nvim |
+| 1 | [`02-stage-1-index-search.md`](02-stage-1-index-search.md) | ✅ **done** — ask a question, get the right section ranked first, jump to its line |
 | 2 | [`03-stage-2-llm.md`](03-stage-2-llm.md) | Grounded streamed answer from Qwen3 over retrieved sections |
 | 3 | [`04-stage-3-actions.md`](04-stage-3-actions.md) | `Alt+1..9` jumps to note, code, video timestamp, app, project |
 | 4 | [`05-stage-4-context.md`](05-stage-4-context.md) | Same query ranks differently depending on the focused window |
@@ -57,8 +57,8 @@ Mostly the spec's recommendation. Where this plan differs, see [`09-decisions.md
 | Layer | Choice | Note |
 |---|---|---|
 | Language | Rust (edition 2024) | as spec |
-| Async | Tokio (multi-thread) — **backend threads only** | Slint owns the main thread |
-| UI | Slint, `renderer-femtovg` | as spec |
+| Async | Tokio (multi-thread) — **backend threads only** | iced owns the main thread; daemon events arrive as a `Subscription` |
+| UI | **iced 0.14 + `iced_wgpu`** (wgpu 27, winit 0.30) | replaces Slint — see `PLAN.md` §1 |
 | X11 | `x11rb` (`randr`, `xproto`) + `raw-window-handle` | direct XID manipulation |
 | Compositing | `picom` | **required** for rounded/transparent dock |
 | DB | `rusqlite` (`bundled` feature) + WAL | bundled pins the FTS5/SQLite version |
@@ -92,9 +92,9 @@ brain-dock/
 │   ├── brain-engine/           # retrieval, ranking, prompt, llm client, actions, corrections
 │   ├── brain-x11/              # EWMH, RandR, active-window/context, window control
 │   ├── brain-daemon/           # bin
-│   ├── brain-dock/             # bin  (Slint)
+│   ├── brain-dock/             # bin  (iced: view.rs, layout.rs, tokens.rs, window.rs)
 │   └── brainctl/               # bin
-├── ui/                         # dock.slint, components/, tokens.slint
+├── ui/assets/                  # fonts and icons; the views are Rust, in brain-dock
 ├── migrations/                 # 001_initial.sql …
 ├── config/brain.example.toml
 ├── benchmarks/retrieval.yaml

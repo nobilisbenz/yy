@@ -16,7 +16,7 @@ Monitor           eDP-1, 1920x1080 @ +0+0   (single monitor)
 RAM               26 GB
 ```
 
-**This split is a gift, and the plan should exploit it.** X, picom, and the Slint dock all
+**This split is a gift, and the plan should exploit it.** X, picom, and the iced dock all
 render on the AMD iGPU through Mesa. The NVIDIA GPU is untouched by the desktop, so
 llama.cpp gets the whole 5.8 GB of VRAM and never competes with the UI for it.
 
@@ -152,7 +152,7 @@ xrender; only blur is lost.
 1. **Toggle is now `$mod+a`** (line 72) — you set this. `$mod+space` remains bound to your
    quick-terminal script; no conflict. Update all docs and the spec's `$mod+space`
    references accordingly.
-2. **Removed `no_focus [class="BrainDock" …]`.** This was a mistake in the original plan —
+2. **Removed `no_focus [class="brain-dock" …]`.** This was a mistake in the original plan —
    `no_focus` tells i3 *not* to focus the window on map, which is the exact opposite of
    what the dock needs.
 3. **Added `focus_on_window_activation smart`.** Without it, i3 ignores the

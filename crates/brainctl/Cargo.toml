@@ -6,6 +6,8 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
+brain-core = { workspace = true }
+brain-engine = { workspace = true }
 brain-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

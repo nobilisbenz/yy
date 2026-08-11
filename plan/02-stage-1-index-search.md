@@ -1,5 +1,27 @@
 # Stage 1 — Index and lexical search
 
+> **Read [`09-decisions.md`](09-decisions.md) §0b first — it changes what this document
+> means.** `brain-index` wraps `yalive::db` / `yalive::parser`; it does not build a second
+> index. Every schema, parser, and FTS5 instruction below is now an instruction to improve
+> `yalive`, not to reimplement it here.
+>
+> **Status: the definition of done at the bottom of this file passes**, measured on a
+> 50-note / 190-section vault. Landed: indices + PRAGMAs, `heading_path`, `supersedes`,
+> `yalive::graph`, external-content FTS5 with triggers and `tokenchars` (§1.2), the
+> migration runner, FTS5 query escaping, front-matter `status:` wired through to ranking,
+> the writer-thread/reader-pool (§1.3), the file watcher (§1.5), config loading and
+> validation (§1.1), the seed → expand → rank pipeline, openers (§1.8), and
+> `brainctl ask / status / reindex / sources / doctor / bench`.
+>
+> Two things here were **not** built as written, both deliberately — see
+> [`09-decisions.md`](09-decisions.md) §11 and §12: the FTS escaping lives in
+> `yalive::search`, not `brain-index::fts`, and the retrieval query joins terms with `OR`
+> rather than `AND`.
+>
+> Still open: search-as-you-type in the dock (§1.9 — the daemon side is done, the dock
+> still sends on Enter), oversized-section subchunking (§1.4), `@action` parsing (§1.4),
+> and the second store for non-vault sources.
+
 **Goal:** ask a keyword-style question and land in the correct Markdown section in nvim.
 
 Still no LLM. When this stage is done Brain Dock is already a useful tool — a fast,
