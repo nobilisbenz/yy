@@ -16,6 +16,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 raw-window-handle = "0.6"
 uuid = { version = "1", features = ["v4"] }
+arboard = "3"
 
 [build-dependencies]
 slint-build = { workspace = true }

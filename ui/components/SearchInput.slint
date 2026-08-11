@@ -11,6 +11,9 @@ export component SearchInput inherits Rectangle {
     callback accepted(string);
     callback edited(string);
     callback dismissed();
+    // One channel for every non-typing key, named rather than raw, so the Rust
+    // side owns the mapping and can make it configurable without touching .slint.
+    callback shortcut(string);
 
     height: Tokens.input-height;
     background: transparent;
@@ -56,6 +59,30 @@ export component SearchInput inherits Rectangle {
                 key-pressed(event) => {
                     if (event.text == Key.Escape) {
                         root.dismissed();
+                        return accept;
+                    }
+                    if (event.text == Key.UpArrow) {
+                        root.shortcut("history-previous");
+                        return accept;
+                    }
+                    if (event.text == Key.DownArrow) {
+                        root.shortcut("history-next");
+                        return accept;
+                    }
+                    if (event.modifiers.control) {
+                        if (event.text == "l") { root.shortcut("clear"); return accept; }
+                        if (event.text == "c") { root.shortcut("copy-answer"); return accept; }
+                        if (event.text == "s") { root.shortcut("show-sources"); return accept; }
+                        if (event.text == "e") { root.shortcut("edit-answer"); return accept; }
+                        if (event.text == "r") { root.shortcut("retry"); return accept; }
+                    }
+                    // Alt+1..9 activates the corresponding action (spec §5).
+                    if (event.modifiers.alt && event.text >= "1" && event.text <= "9") {
+                        root.shortcut("action-" + event.text);
+                        return accept;
+                    }
+                    if (event.text == Key.Tab) {
+                        root.shortcut(event.modifiers.shift ? "action-previous" : "action-next");
                         return accept;
                     }
                     return reject;

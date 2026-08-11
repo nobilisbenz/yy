@@ -46,11 +46,20 @@ export component Dock inherits Window {
     callback submit(string);
     callback edited(string);
     callback dismiss();
+    callback shortcut(string);
     callback activate-action(int);
-    callback copy-answer();
-    callback clear-query();
 
     forward-focus: input;
+
+    // Driven from Rust on map/unmap: ~100ms in, ~80ms out (spec §41).
+    //
+    // Opacity only. Spec §41 also suggests a slight scale, but the X11 window
+    // is sized exactly to the card, so a scaled card would simply clip against
+    // its own window edge — the growth would have to come from resizing the
+    // window every frame, which is both expensive and visibly steppy.
+    //
+    // Nothing else animates: per-token or per-button motion reads as lag.
+    in property <bool> revealed: true;
 
     card := Rectangle {
         width: 100%;
@@ -58,6 +67,12 @@ export component Dock inherits Window {
         border-radius: Tokens.radius;
         border-width: 1px;
         border-color: Tokens.border;
+
+        opacity: root.revealed ? 1.0 : 0.0;
+        animate opacity {
+            duration: root.revealed ? Tokens.show-ms : Tokens.hide-ms;
+            easing: ease-out;
+        }
 
         VerticalLayout {
             alignment: start;
@@ -67,6 +82,7 @@ export component Dock inherits Window {
                 accepted(text) => { root.submit(text); }
                 edited(text) => { root.edited(text); }
                 dismissed => { root.dismiss(); }
+                shortcut(name) => { root.shortcut(name); }
             }
 
             if root.state != DockState.input: Rectangle {
@@ -117,15 +133,6 @@ export component Dock inherits Window {
                 }
             }
         }
-    }
-
-    // Keyboard paths that are not the text field's own (spec §5). Routed
-    // through one scope so the Rust side owns the mapping and can make it
-    // configurable later.
-    keys := FocusScope {
-        // Sits behind the input; the input takes precedence for typing.
-        width: 0px;
-        height: 0px;
     }
 
     public function focus-query() {

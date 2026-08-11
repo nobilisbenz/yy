@@ -1,0 +1,144 @@
+# Brain Dock configuration.
+#
+# Copy to ~/.config/brain/config.toml. Every tunable lives here rather than in
+# code, because Stage 7 settles the ranking weights by benchmark sweep and a
+# literal in a source file cannot be swept.
+#
+# Values marked (Stage N) are read from this file only once that stage lands;
+# they are listed now so the shape of the file does not churn.
+
+[dock]
+anchor = "top-right"
+
+# Gap *below the panel*, not from the screen edge. The usable area is derived
+# from panel struts (_NET_WM_STRUT_PARTIAL), so on this machine polybar's 30px
+# is already excluded and this is a further 8px of breathing room.
+#
+# Note i3 does not publish _NET_WORKAREA, so the struts are read directly.
+margin_top = 8
+margin_side = 22
+
+width = 560
+max_height = 520
+
+# Give focus back to the window that had it when the dock was summoned.
+restore_previous_focus = true
+
+# UI scale. 1.0 matches an unscaled 96 DPI X session. winit guesses 1.5 on some
+# laptop panels with no Xft.dpi set, which renders the dock half again larger
+# than every other window; this pins both SLINT_SCALE_FACTOR and
+# WINIT_X11_SCALE_FACTOR. Raise it on a genuinely HiDPI display.
+scale = 1.0
+
+[logging]
+level = "info"
+# Never log note contents by default (spec §50).
+log_queries = false
+log_source_paths = true
+# Ctrl+Shift+S source inspector with per-stage scores and timings (Stage 7).
+debug_ui = false
+
+# ---------------------------------------------------------------------------
+# Stage 1
+# ---------------------------------------------------------------------------
+
+[search]
+lexical_limit = 30
+fused_limit = 20
+context_sections = 5
+
+# bm25() column weights: heading, heading_path, body. Heading matches carry
+# most of the retrieval signal in a notes corpus, hence the 8x.
+bm25_heading = 8.0
+bm25_heading_path = 4.0
+bm25_body = 1.0
+
+# Ranking multipliers for front-matter `status:` (spec §47). Strongly penalise
+# superseded workflows so old and new do not blend together in one answer.
+[search.status_weight]
+current = 1.0
+draft = 0.9
+archived = 0.4
+obsolete = 0.25
+
+[indexing]
+max_section_tokens = 700
+subchunk_target_tokens = 450
+subchunk_overlap_tokens = 60
+# Editors save in bursts; nvim's atomic save is a rename pair.
+debounce_ms = 400
+
+# Never index $HOME wholesale (spec §29).
+[[sources]]
+name = "notes"
+path = "~/brain"
+include = ["**/*.md", "**/*.txt"]
+# `.notes/` is another tool's sidecar index; it is not prose.
+exclude = ["**/.git/**", "**/.notes/**"]
+
+# [[sources]]
+# name = "code"
+# path = "~/projects"
+# include = ["**/*.rs", "**/*.toml", "**/*.md"]
+# exclude = ["**/.git/**", "**/target/**", "**/node_modules/**"]
+
+[openers]
+markdown = ["ghostty", "-e", "nvim", "+{line}", "{path}"]
+text = ["ghostty", "-e", "nvim", "+{line}", "{path}"]
+directory = ["xdg-open", "{path}"]
+url = ["xdg-open", "{url}"]
+
+# ---------------------------------------------------------------------------
+# Stage 2
+# ---------------------------------------------------------------------------
+
+[llm]
+backend = "llama-server"
+profile = "fast"
+host = "127.0.0.1"
+port = 8177
+context_tokens = 4096
+max_output_tokens = 350
+temperature = 0.15
+top_p = 0.85
+keep_loaded = true
+
+[llm.profiles.fast]
+model = "~/.local/share/brain/models/Qwen_Qwen3-1.7B-Q5_K_M.gguf"
+
+# [llm.profiles.quality]
+# model = "~/.local/share/brain/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
+
+[answers]
+# Do not let the model improvise from pretraining. A confident "not in your
+# files" is a feature (spec §45).
+general_knowledge_fallback = false
+show_source = true
+
+# ---------------------------------------------------------------------------
+# Stage 4-7
+# ---------------------------------------------------------------------------
+
+[context]
+enabled = true
+
+[search.context_boost]
+active_app = 1.25
+current_project = 1.35
+heading_match = 1.30
+recent_source = 1.10
+
+# WM_CLASS is rarely what you write in a note. Seed this from `wmctrl -lx`.
+[context.aliases]
+blender = ["blender", "Blender"]
+obs = ["obs", "com.obsproject.Studio"]
+ghostty = ["ghostty", "com.mitchellh.ghostty"]
+
+[search.fusion]
+k = 60
+lexical_weight = 1.0
+semantic_weight = 1.0
+
+[retrieval.reranker]
+# Costs 50-150ms. Turn on only if the Stage 7 benchmark says it earns that.
+enabled = false

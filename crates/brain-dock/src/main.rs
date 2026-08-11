@@ -10,6 +10,7 @@
 //! both of which already run there.
 
 mod ipc;
+mod keys;
 mod platform;
 mod stream;
 mod window;
@@ -19,6 +20,7 @@ use std::cell::{Cell, RefCell};
 use anyhow::{Context, Result};
 use brain_proto::{ClientRequest, ServerEvent};
 use clap::Parser;
+use slint::Model as _;
 use window::{DockGeometry, WindowController};
 
 slint::include_modules!();
@@ -29,6 +31,8 @@ thread_local! {
 
     /// The query currently on screen. Events for any other are discarded.
     static CURRENT_QUERY: Cell<Option<uuid::Uuid>> = const { Cell::new(None) };
+
+    static HISTORY: RefCell<keys::History> = RefCell::new(keys::History::new());
 }
 
 fn current_query() -> Option<uuid::Uuid> {
@@ -286,6 +290,7 @@ fn apply(dock: &Dock, event: ServerEvent) {
 
 fn show(dock: &Dock) {
     with_window(|controller| controller.show(dock.window().size().width));
+    dock.set_revealed(true);
 
     // Focus the field *after* mapping: focusing an unmapped window is a no-op,
     // and the dock would come up with no caret.
@@ -293,10 +298,22 @@ fn show(dock: &Dock) {
 }
 
 fn hide(dock: &Dock) {
-    with_window(WindowController::hide);
+    dock.set_revealed(false);
+
+    // Let the fade finish before unmapping, or the card vanishes instead of
+    // fading. Unmapping is what actually hides it; the animation is only worth
+    // waiting for because it is shorter than a frame budget's worth of delay.
+    let weak = dock.as_weak();
+    slint::Timer::single_shot(std::time::Duration::from_millis(80), move || {
+        // If the user re-summoned during the fade, leave it alone.
+        if weak.upgrade().is_some_and(|dock| dock.get_revealed()) {
+            return;
+        }
+        with_window(WindowController::hide);
+    });
+
     // Deliberately does not clear the query or answer. Reopening a second
     // later should show what was there (spec §42).
-    let _ = dock;
 }
 
 fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<ClientRequest>) {
@@ -337,6 +354,7 @@ fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<Cli
             let id = uuid::Uuid::new_v4();
             CURRENT_QUERY.with(|cell| cell.set(Some(id)));
             stream::begin(id);
+            HISTORY.with(|h| h.borrow_mut().push(&text));
 
             if let Some(dock) = weak.upgrade() {
                 dock.set_state(DockState::Searching);
@@ -363,27 +381,21 @@ fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<Cli
         // Live retrieval lands in Stage 1, where there is an index to search.
     });
 
-    dock.on_clear_query({
-        let weak = dock.as_weak();
-        move || {
-            if let Some(dock) = weak.upgrade() {
-                dock.invoke_clear();
-            }
-        }
-    });
-
     dock.on_activate_action(|index| {
         tracing::info!(index, "action activated (Stage 3)");
     });
 
-    dock.on_copy_answer(|| {
-        // Copy what has actually streamed so far, not the last flushed batch:
-        // Ctrl+C mid-answer should give you everything you can see.
-        let answer = stream::current();
-        if answer.is_empty() {
-            return;
+    dock.on_shortcut({
+        let weak = dock.as_weak();
+        let tx = to_daemon.clone();
+        move |name| {
+            let Some(dock) = weak.upgrade() else { return };
+            let Some(command) = keys::Command::parse(&name) else {
+                tracing::debug!(%name, "unknown shortcut");
+                return;
+            };
+            handle_shortcut(&dock, command, &tx);
         }
-        tracing::info!(chars = answer.len(), "copy answer (clipboard lands in C9)");
     });
 
     // Slint resizes the window as the answer grows. Keep the anchored edge
@@ -394,6 +406,100 @@ fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<Cli
         with_window(WindowController::hide);
         slint::CloseRequestResponse::KeepWindowShown
     });
+}
+
+fn handle_shortcut(
+    dock: &Dock,
+    command: keys::Command,
+    tx: &tokio::sync::mpsc::UnboundedSender<ClientRequest>,
+) {
+    use keys::Command;
+
+    match command {
+        Command::ClearQuery => {
+            dock.invoke_clear();
+            dock.set_state(DockState::Input);
+        }
+
+        Command::CopyAnswer => {
+            // Copy what has streamed so far, not the last flushed batch:
+            // Ctrl+C mid-answer should give you everything on screen.
+            let answer = stream::current();
+            if answer.is_empty() {
+                return;
+            }
+            match copy_to_clipboard(&answer) {
+                Ok(()) => tracing::info!(chars = answer.len(), "answer copied"),
+                Err(err) => tracing::error!("{err:#}"),
+            }
+        }
+
+        Command::HistoryPrevious => {
+            let current = dock.get_query().to_string();
+            if let Some(entry) = HISTORY.with(|h| h.borrow_mut().previous(&current)) {
+                dock.set_query(entry.into());
+            }
+        }
+        Command::HistoryNext => {
+            if let Some(entry) = HISTORY.with(|h| h.borrow_mut().next()) {
+                dock.set_query(entry.into());
+            }
+        }
+
+        Command::SelectNextAction | Command::SelectPreviousAction => {
+            let count = dock.get_actions().row_count() as i32;
+            if count == 0 {
+                return;
+            }
+            let step = if command == Command::SelectNextAction { 1 } else { -1 };
+            // Wraps in both directions; `rem_euclid` keeps -1 at the end
+            // rather than off the front.
+            let next = (dock.get_selected_action() + step).rem_euclid(count);
+            dock.set_selected_action(next);
+        }
+
+        Command::Activate(index) => {
+            if index < dock.get_actions().row_count() {
+                dock.invoke_activate_action(index as i32);
+            }
+        }
+
+        Command::Retry => {
+            let query = dock.get_query().to_string();
+            if !query.trim().is_empty() {
+                dock.invoke_submit(query.into());
+            }
+        }
+
+        // Both need somewhere to put the result, which arrives with the
+        // correction editor (Stage 6) and the sources panel (Stage 1).
+        Command::EditAnswer | Command::ShowSources => {
+            tracing::info!(?command, "not implemented yet");
+        }
+    }
+
+    let _ = tx;
+}
+
+/// X11 clipboard ownership requires a live process holding the selection, so
+/// the copy has to outlive this function. `arboard` keeps a background thread
+/// for exactly that; the handle is parked for the process lifetime rather than
+/// recreated per copy, which would drop the selection each time.
+fn copy_to_clipboard(text: &str) -> Result<()> {
+    thread_local! {
+        static CLIPBOARD: RefCell<Option<arboard::Clipboard>> = const { RefCell::new(None) };
+    }
+
+    CLIPBOARD.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        if slot.is_none() {
+            *slot = Some(arboard::Clipboard::new().context("opening the clipboard")?);
+        }
+        slot.as_mut()
+            .expect("just initialised")
+            .set_text(text)
+            .context("writing to the clipboard")
+    })
 }
 
 fn visible() -> bool {

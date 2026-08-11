@@ -115,10 +115,17 @@ impl DockWindow {
             self.mapped = true;
         }
 
-        // Re-assert stacking after mapping: another always-on-top window
-        // mapped since our last summon would otherwise sit above us.
+        // Re-assert stacking on every summon: another window mapped since the
+        // last one would otherwise sit above us.
+        //
+        // The explicit raise is what actually keeps the dock on top under i3,
+        // which ignores `_NET_WM_STATE_ABOVE` entirely — reasonably, since a
+        // tiling WM has no always-on-top concept. Verified: after a summon the
+        // window reports only STICKY and FOCUSED, yet sits last in
+        // `_NET_CLIENT_LIST_STACKING`. The ABOVE hint is still re-sent for
+        // window managers that do honour it.
         self.raise()?;
-        self.set_state_flags()?;
+        self.request_above()?;
         self.focus()?;
         self.conn.flush()?;
         Ok(())
@@ -265,42 +272,48 @@ impl DockWindow {
         Ok(())
     }
 
-    /// Above, sticky, and out of the taskbar and pager.
+    /// Declare the initial state, before the window is ever mapped.
     ///
-    /// Which mechanism is correct depends on whether the window is mapped —
-    /// see the module comment.
+    /// While unmapped the property is ours to write directly; once mapped the
+    /// window manager owns it and only a `ClientMessage` will do. This is
+    /// called from `apply_persistent_properties`, so the unmapped path is the
+    /// correct one — see the module comment.
     fn set_state_flags(&self) -> Result<(), X11Error> {
-        let states = [
-            self.atoms._NET_WM_STATE_ABOVE,
-            self.atoms._NET_WM_STATE_STICKY,
-            self.atoms._NET_WM_STATE_SKIP_TASKBAR,
-            self.atoms._NET_WM_STATE_SKIP_PAGER,
-        ];
+        debug_assert!(!self.mapped, "state flags must be declared before mapping");
 
-        if self.mapped {
-            for state in states {
-                let event = ClientMessageEvent::new(
-                    32,
-                    self.window,
-                    self.atoms._NET_WM_STATE,
-                    [STATE_ADD, state, 0, SOURCE_PAGER, 0],
-                );
-                self.conn.send_event(
-                    false,
-                    self.root,
-                    EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
-                    event,
-                )?;
-            }
-        } else {
-            self.conn.change_property32(
-                PropMode::REPLACE,
-                self.window,
-                self.atoms._NET_WM_STATE,
-                AtomEnum::ATOM,
-                &states,
-            )?;
-        }
+        self.conn.change_property32(
+            PropMode::REPLACE,
+            self.window,
+            self.atoms._NET_WM_STATE,
+            AtomEnum::ATOM,
+            &[
+                self.atoms._NET_WM_STATE_ABOVE,
+                self.atoms._NET_WM_STATE_STICKY,
+                self.atoms._NET_WM_STATE_SKIP_TASKBAR,
+                self.atoms._NET_WM_STATE_SKIP_PAGER,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Re-request always-on-top on a mapped window.
+    ///
+    /// Only `_ABOVE`, deliberately. Re-sending the whole set on every summon
+    /// appends a duplicate `_NET_WM_STATE_STICKY` each time under i3, since
+    /// sticky is already held and ADD is not idempotent there.
+    fn request_above(&self) -> Result<(), X11Error> {
+        let event = ClientMessageEvent::new(
+            32,
+            self.window,
+            self.atoms._NET_WM_STATE,
+            [STATE_ADD, self.atoms._NET_WM_STATE_ABOVE, 0, SOURCE_PAGER, 0],
+        );
+        self.conn.send_event(
+            false,
+            self.root,
+            EventMask::SUBSTRUCTURE_NOTIFY | EventMask::SUBSTRUCTURE_REDIRECT,
+            event,
+        )?;
         Ok(())
     }
 
