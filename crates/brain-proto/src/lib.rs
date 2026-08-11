@@ -15,7 +15,7 @@ pub mod socket;
 pub use codec::{ClientConnection, Connection, ProtoError, Receiver, Sender, ServerConnection};
 pub use message::{
     ActionKind, ActionView, CacheStatus, ClientRequest, DesktopContext, ServerEvent, SourceRef,
-    StatusReport, TimingInfo,
+    NO_CONTEXT, StatusReport, TimingInfo,
 };
 // The ids appear in this crate's public types, so anyone holding a `SourceRef` or an
 // `ActionView` needs to be able to name them without also depending on `brain-core`.

@@ -54,15 +54,28 @@ pub struct Hit {
     pub status: Option<String>,
 }
 
-impl From<SectionRow> for Hit {
-    fn from(row: SectionRow) -> Self {
+impl Hit {
+    /// Build a hit, resolving the row's path against the vault it came from.
+    ///
+    /// **`yalive` stores `files.path` relative to the vault root.** A `Hit` is handed to
+    /// code that opens files and checks whether they exist, and a relative path there
+    /// resolves against the daemon's working directory — so every note action reported
+    /// itself as broken and `Alt+1` would have opened nothing. Joining here, at the one
+    /// place that knows the vault, is what keeps that from being rediscovered.
+    pub fn from_row(row: SectionRow, vault: &Path) -> Self {
+        let path = if row.path.is_absolute() {
+            row.path
+        } else {
+            vault.join(row.path)
+        };
+
         Self {
             section_uid: row.uid,
             note_title: row.note_title,
             heading: row.heading,
             heading_path: row.heading_path,
             body: row.body,
-            path: row.path,
+            path,
             start_line: row.start_line,
             status: row.status,
         }
@@ -142,7 +155,10 @@ impl VaultIndex {
         };
 
         let hits = self.database.search_expression(&expression, weights, limit)?;
-        Ok(hits.into_iter().map(Hit::from).collect())
+        Ok(hits
+            .into_iter()
+            .map(|row| Hit::from_row(row, &self.vault))
+            .collect())
     }
 
     /// The typed graph, for expansion and ranking.

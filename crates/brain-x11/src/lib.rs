@@ -8,10 +8,12 @@
 //! platform we do not support would cost clarity for nothing.
 
 pub mod atoms;
+pub mod context;
 pub mod dock_window;
 pub mod geometry;
 
 pub use atoms::Atoms;
+pub use context::Context;
 pub use dock_window::DockWindow;
 pub use geometry::{Anchor, Placement, Rect};
 

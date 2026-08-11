@@ -132,7 +132,7 @@ fn handle(
             id,
             text,
             retrieval_only,
-            ..
+            context,
         } => {
             // A new query supersedes whatever this connection had running.
             // Without this, an abandoned query keeps streaming tokens that the
@@ -141,6 +141,15 @@ fn handle(
             for (_, cancel) in running.drain() {
                 cancel.cancel();
             }
+
+            // A client with nothing to report — `brainctl ask` from a terminal — gets the
+            // context captured at the last summon. `--no-context` says so explicitly and
+            // is left alone.
+            let context = if context.is_empty() {
+                daemon.context()
+            } else {
+                context
+            };
 
             let cancel = CancellationToken::new();
             running.insert(id, cancel.clone());
@@ -151,7 +160,9 @@ fn handle(
                     let daemon = Arc::clone(daemon);
                     tokio::spawn(async move {
                         if let Some(timing) =
-                            backend.query(id, text, retrieval_only, events, cancel).await
+                            backend
+                                .query(id, text, retrieval_only, context, events, cancel)
+                                .await
                         {
                             // Keep `brainctl status` honest about the last query. A
                             // cancelled query reports nothing rather than a truncated time.

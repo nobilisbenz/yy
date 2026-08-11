@@ -9,6 +9,8 @@ license.workspace = true
 brain-core.workspace = true
 brain-proto = { workspace = true }
 brain-index = { workspace = true }
+brain-x11 = { workspace = true }
+x11rb = { workspace = true }
 brain-engine = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

@@ -1,5 +1,37 @@
 # Stage 7 — Benchmark, tune, and V1 close-out
 
+> **Status: the harness is built and has already earned its keep.**
+>
+> ```text
+> baseline  n=6
+> Recall@1  0.83      MRR      0.89
+> Recall@3  1.00      p50      0.2 ms
+> Recall@5  1.00      p95      1.2 ms
+> ```
+>
+> **The first sweep found a real ranking bug.** `how long are backups kept?` matched nothing
+> at all — the answering section shares no vocabulary with the question and is only reachable
+> as a subsection of the note that *did* match. That path costs
+> `1.0 × 0.6 × 0.6(related) × 0.6 × 0.3(parent) = 0.065`, just under the `min_weight = 0.1`
+> default, so it was being cut off. Swept to 0.05: **Recall@3 0.83 → 1.00, MRR 0.83 → 0.89,
+> no latency change.** That default was set by intuition and was wrong, which is the entire
+> argument for this stage existing.
+>
+> Built: `brain-bench` with Recall@1/3/5, MRR, p50/p95; sweep mode over any dotted config key
+> (via TOML, so a misspelled key is refused rather than silently ignored); baseline diffing
+> that lists which questions moved; a frozen fixture vault with a committed question set; a
+> `cargo test` regression gate with Recall@3 and MRR floors; and `brainctl bench-export`,
+> which turns rated answers into a question set — verified end to end, with `bad`-rated rows
+> correctly excluded.
+>
+> Not built: the `Ctrl+Shift+S` debug view (§7.3), which is UI work; the tuning passes in
+> §7.4 beyond the one above, which want a real question set rather than six fixtures; and the
+> V1 checklist in §7.6.
+>
+> **The tuning set is still the binding constraint.** `benchmarks/fixture.yaml` is a
+> regression tripwire, not evidence — six questions move on noise. `retrieval.yaml` needs
+> ~40 rated answers, and rating happens by using the dock.
+
 **Goal:** every further change to ranking, prompting, or models is decided by a number
 rather than by an impression.
 

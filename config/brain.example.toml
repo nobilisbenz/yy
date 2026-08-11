@@ -62,7 +62,9 @@ enabled = true
 max_hops = 2
 seed_count = 5
 hop_decay = 0.6
-min_weight = 0.1
+# Swept in Stage 7: 0.1 cut off two-hop paths through structural parent edges,
+# which cost Recall@3 0.83 vs 1.00 on the fixture set.
+min_weight = 0.05
 
 # Ranking multipliers for front-matter `status:` (spec §47). Strongly penalise
 # superseded workflows so old and new do not blend together in one answer.
@@ -103,6 +105,12 @@ text = ["ghostty", "-e", "nvim", "+{line}", "{path}"]
 directory = ["xdg-open", "{path}"]
 url = ["xdg-open", "{url}"]
 # {seconds} is substituted for a video timestamp action (Stage 3).
+#
+# If this program is not installed the daemon falls back silently: mpv if it is
+# present, otherwise xdg-open with the timestamp rebuilt into the URL. So a
+# config synced between machines does not leave a dead button (spec §51).
+# Set it to a real player to open at the timestamp rather than at 0:00:
+#   video = ["mpv", "--start={seconds}", "{url}"]
 video = ["xdg-open", "{url}"]
 
 # ---------------------------------------------------------------------------

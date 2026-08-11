@@ -1,5 +1,30 @@
 # Stage 4 — Desktop context
 
+> **Status: the definition of done passes.** Capture measured at **373 µs** against the
+> 10 ms budget, including the `/proc` descent — which correctly walked
+> `com.mitchellh.ghostty.agent` down to the `tmux: client` running inside it.
+>
+> The same query, with ghostty focused:
+>
+> ```text
+> with context     [1] Splitting panes in ghostty   matched heading · matches the focused app
+>                  [2] Splitting windows in vim
+> --no-context     [1] Splitting windows in vim
+>                  [2] Splitting panes in ghostty
+> ```
+>
+> Both results are present either way — context reorders, it never filters (§4.2).
+>
+> **Found while verifying:** the alias table looked correct and did nothing. Ghostty's
+> terminal reports `WM_CLASS = com.mitchellh.ghostty.agent`, while the obvious config entry
+> is `com.mitchellh.ghostty`; an exact-match lookup missed, fell back to the full reverse-DNS
+> string, and matched no note text. Aliases now also match a reverse-DNS *sub*-identifier,
+> and the unaliased fallback uses the name a person would actually write (`ghostty`, not
+> `com.mitchellh.ghostty.agent`).
+>
+> Not built: `recent_source` boosting, which needs the action-open history that does not
+> exist yet, and the benchmark's `context:` field, which waits on the Stage 7 harness.
+
 **Goal:** the same vague query returns different, better results depending on what you were
 doing when you pressed the shortcut.
 

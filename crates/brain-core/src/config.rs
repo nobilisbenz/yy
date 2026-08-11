@@ -271,7 +271,13 @@ impl Default for GraphSearch {
             max_hops: 2,
             seed_count: 5,
             hop_decay: 0.6,
-            min_weight: 0.1,
+            // Settled by the Stage 7 sweep rather than by intuition, which had it at 0.1.
+            // A two-hop path through a structural `parent` edge scores
+            // 1.0 × 0.6 × 0.6(related) × 0.6 × 0.3(parent) = 0.065 — just under 0.1 — so
+            // the old default silently cut off exactly the "the answer is a subsection of
+            // the note that matched" case. Measured on the fixture set:
+            // Recall@3 0.83 → 1.00, MRR 0.83 → 0.89, no latency change.
+            min_weight: 0.05,
         }
     }
 }

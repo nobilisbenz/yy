@@ -20,11 +20,12 @@
 //! only asks each signal for an ordering, which is the thing both can honestly supply.
 
 pub mod actions;
+pub mod desktop;
 pub mod llm;
 pub mod prompt;
 pub mod store;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use brain_core::config::{Fusion, GraphSearch, Search, StatusWeight};
 use brain_index::{Hit, Index, IndexError};
@@ -55,6 +56,10 @@ pub struct Explain {
     /// Whether that edge was followed backwards — i.e. this is a backlink.
     pub backwards: bool,
     pub heading_match: bool,
+    /// The focused application, or one the query named, appears in this section.
+    pub active_app: bool,
+    /// This section's document is under the focused process's working directory.
+    pub current_project: bool,
     pub status_weight: f32,
 }
 
@@ -75,6 +80,12 @@ impl Explain {
                 "{hops} {plural} {direction} {}",
                 relation.as_str()
             ));
+        }
+        if self.current_project {
+            parts.push("in the current project".to_string());
+        }
+        if self.active_app {
+            parts.push("matches the focused app".to_string());
         }
         if self.status_weight < 1.0 {
             parts.push("superseded".to_string());
@@ -269,9 +280,10 @@ async fn expand(index: &Index, config: &Search, seeds: &[Hit]) -> Result<Vec<Exp
         .read(move |database| Ok(database.sections_by_uids(&wanted)?))
         .await?;
 
+    let vault = index.vault().to_path_buf();
     let mut expanded: Vec<Expanded> = rows
         .into_iter()
-        .map(Hit::from)
+        .map(|row| Hit::from_row(row, &vault))
         .filter_map(|hit| {
             let (hops, via, backwards) = metadata.get(&hit.section_uid).copied()?;
             Some(Expanded {
@@ -335,6 +347,143 @@ fn rank(config: &Search, seeds: Vec<Hit>, expanded: Vec<Expanded>) -> Vec<Ranked
     });
     ranked.truncate(config.fused_limit);
     ranked
+}
+
+/// Boost results that match what the user was doing when they asked.
+///
+/// Spec §18's constraint, and the one that shapes this whole function: context **boosts,
+/// it never filters**. Hard-filtering to the active application makes "how did I do X in
+/// Blender" work beautifully while Blender is focused, and makes every *other* question
+/// asked at that moment silently return nothing — a failure the user cannot see the cause
+/// of. Multipliers degrade gracefully; filters do not.
+///
+/// Two signals, both cheap:
+///
+/// - **active app** — the focused window's `WM_CLASS`, mapped through `[context.aliases]`
+///   because `WM_CLASS` is almost never what a person writes in a note.
+/// - **current project** — the section's document sits under the focused process's working
+///   directory, which is why the `/proc` descent bothers to find the *editor's* cwd rather
+///   than the terminal's.
+///
+/// **A query that names an app wins over the focused window.** Asking "how do I mirror bones
+/// in Blender" while OBS happens to be focused should rank Blender notes first; the explicit
+/// mention is a stronger signal than ambient focus, and ignoring it is the most obvious way
+/// for context ranking to feel wrong.
+pub fn apply_context(
+    config: &Search,
+    context: &brain_proto::DesktopContext,
+    aliases: &BTreeMap<String, Vec<String>>,
+    query: &str,
+    results: &mut [Ranked],
+) {
+    let named_in_query = app_named_in(query, aliases);
+    let focused = context
+        .wm_class
+        .as_deref()
+        .and_then(|class| alias_for(class, aliases));
+
+    // The explicit mention wins.
+    let app = named_in_query.or(focused);
+    let project = context.cwd.as_deref();
+
+    if app.is_none() && project.is_none() {
+        return;
+    }
+
+    for entry in results.iter_mut() {
+        let mut multiplier = 1.0;
+
+        if let Some(app) = &app {
+            // Matched against the note's own text and heading path rather than a dedicated
+            // `apps:` field: front matter is optional and most notes do not carry it, so
+            // requiring it would make this boost apply to almost nothing.
+            let haystack = format!(
+                "{} {} {}",
+                entry.hit.note_title, entry.hit.heading_path, entry.hit.body
+            )
+            .to_lowercase();
+            if haystack.contains(app.as_str()) {
+                multiplier *= config.context_boost.active_app;
+                entry.explain.active_app = true;
+            }
+        }
+
+        if let Some(project) = project
+            && entry.hit.path.starts_with(project)
+        {
+            multiplier *= config.context_boost.current_project;
+            entry.explain.current_project = true;
+        }
+
+        entry.score *= multiplier;
+    }
+
+    results.sort_by(|left, right| {
+        right
+            .score
+            .partial_cmp(&left.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+}
+
+/// Map a `WM_CLASS` to the name a note would use for it.
+///
+/// `com.obsproject.Studio` is what X reports; `obs` is what someone writes. Falls back to
+/// the lowercased class so an app with no alias still gets *some* boost.
+fn alias_for(wm_class: &str, aliases: &BTreeMap<String, Vec<String>>) -> Option<String> {
+    let class = wm_class.to_lowercase();
+    if class.is_empty() {
+        return None;
+    }
+
+    for (name, variants) in aliases {
+        let matched = variants.iter().any(|variant| {
+            let variant = variant.to_lowercase();
+            // Exact, or a reverse-DNS sub-identifier of it. Observed live:
+            // ghostty's terminal reports `com.mitchellh.ghostty.agent`, while the
+            // obvious thing to put in the config is `com.mitchellh.ghostty`. Requiring
+            // an exact match makes the alias table look correct and do nothing.
+            class == variant || class.starts_with(&format!("{variant}."))
+        });
+        if matched {
+            return Some(name.to_lowercase());
+        }
+    }
+
+    // No alias. Fall back to the most name-like part of the class rather than the whole
+    // string: a note says "ghostty", never "com.mitchellh.ghostty.agent", so matching on
+    // the full reverse-DNS id would never fire.
+    Some(informal_name(&class))
+}
+
+/// The part of a `WM_CLASS` a person would actually write.
+///
+/// `com.obsproject.Studio` → `studio`; `Blender` → `blender`. Trailing segments that are
+/// plainly not a program name are skipped, since `…ghostty.agent` should read as "ghostty".
+fn informal_name(class: &str) -> String {
+    const SUFFIXES: &[&str] = &["agent", "app", "desktop", "bin", "gui"];
+
+    let segments: Vec<&str> = class.split('.').filter(|part| !part.is_empty()).collect();
+    for segment in segments.iter().rev() {
+        if !SUFFIXES.contains(segment) {
+            return (*segment).to_string();
+        }
+    }
+    class.to_string()
+}
+
+/// Does the query itself name a configured app?
+fn app_named_in(query: &str, aliases: &BTreeMap<String, Vec<String>>) -> Option<String> {
+    let query = query.to_lowercase();
+    aliases
+        .keys()
+        .find(|name| {
+            // Word-boundary-ish: `obs` should not match `observability`.
+            query
+                .split(|c: char| !c.is_alphanumeric())
+                .any(|word| word == name.to_lowercase())
+        })
+        .map(|name| name.to_lowercase())
 }
 
 /// Apply the heading-match boost for a query.
@@ -463,6 +612,50 @@ mod tests {
         assert!(smoothing.explain.describe().contains("contradicts"));
     }
 
+    /// A subsection whose links live on its parent still expands.
+    ///
+    /// Links get written where a topic is introduced, so the subsection that matches a query
+    /// routinely declares no edges of its own. Reaching the parent's links means traversing
+    /// the structural `parent` edge and then an authored one — two hops, and cheap ones, so
+    /// this is really a test that `min_weight` does not cut that path off. It did, at the
+    /// old default of 0.1, and the Stage 7 sweep is what found it.
+    #[tokio::test]
+    async fn a_subsection_reaches_the_links_its_parent_declared() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("pg.md"),
+            "---\nid: pg\ntitle: Postgres\n---\n\
+             # Backups {#root}\n\
+             related:: [[restic#root]]\n\
+             ## Retention policy {#retention}\n\
+             Keep fourteen Uniquetoken dailies and eight weeklies.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("restic.md"),
+            "---\nid: restic\ntitle: Restic\n---\n# Restic {#root}\nOffsite copies.\n",
+        )
+        .unwrap();
+        let index = open(&dir).await;
+
+        // The query matches only the subsection, which declares no relations at all.
+        let found = retrieve(&index, &Search::default(), "Uniquetoken").await.unwrap();
+        assert_eq!(found.results[0].hit.section_uid, "pg#retention");
+
+        assert!(
+            found
+                .results
+                .iter()
+                .any(|entry| entry.hit.section_uid == "restic#root"),
+            "expansion did not reach the link declared on the parent: {:?}",
+            found
+                .results
+                .iter()
+                .map(|entry| &entry.hit.section_uid)
+                .collect::<Vec<_>>()
+        );
+    }
+
     #[tokio::test]
     async fn disabling_the_graph_leaves_only_lexical_results() {
         let dir = vault();
@@ -511,6 +704,162 @@ mod tests {
             let found = retrieve(&index, &Search::default(), query).await.unwrap();
             assert!(found.results.is_empty(), "{query:?} returned results");
         }
+    }
+
+    fn aliases() -> BTreeMap<String, Vec<String>> {
+        BTreeMap::from([
+            ("obs".to_string(), vec!["com.obsproject.Studio".to_string()]),
+            ("blender".to_string(), vec!["Blender".to_string()]),
+        ])
+    }
+
+    fn context(wm_class: Option<&str>, cwd: Option<&str>) -> brain_proto::DesktopContext {
+        brain_proto::DesktopContext {
+            wm_class: wm_class.map(String::from),
+            cwd: cwd.map(std::path::PathBuf::from),
+            ..Default::default()
+        }
+    }
+
+    /// The constraint the whole feature hangs on: context **boosts, it never filters**.
+    ///
+    /// Hard-filtering to the focused app makes "how do I do X in Blender" work beautifully
+    /// while Blender is focused, and makes every *other* question asked at that moment
+    /// silently return nothing — with no visible cause.
+    #[test]
+    fn context_reorders_results_without_removing_any() {
+        let mut results = ranked_paths(&["/tmp/a.md", "/tmp/b.md", "/tmp/c.md"]);
+        let before = results.len();
+
+        apply_context(
+            &Search::default(),
+            &context(Some("com.obsproject.Studio"), None),
+            &aliases(),
+            "how do I do the thing",
+            &mut results,
+        );
+
+        assert_eq!(results.len(), before, "context filtered results away");
+    }
+
+    #[test]
+    fn a_section_mentioning_the_focused_app_ranks_above_one_that_does_not() {
+        let mut results = ranked_paths(&["/tmp/unrelated.md", "/tmp/obs.md"]);
+        results[1].hit.body = "Set the OBS crop filter.".into();
+        // Start them level so only the context boost can separate them.
+        results[0].score = 1.0;
+        results[1].score = 1.0;
+
+        apply_context(
+            &Search::default(),
+            &context(Some("com.obsproject.Studio"), None),
+            &aliases(),
+            "the crop filter",
+            &mut results,
+        );
+
+        assert_eq!(results[0].hit.path.to_str().unwrap(), "/tmp/obs.md");
+        assert!(results[0].explain.active_app);
+        assert!(results[0].explain.describe().contains("focused app"));
+    }
+
+    #[test]
+    fn a_document_under_the_focused_directory_is_boosted() {
+        let mut results = ranked_paths(&["/home/nabi/brain/other.md", "/tmp/game/notes.md"]);
+        results[0].score = 1.0;
+        results[1].score = 1.0;
+
+        apply_context(
+            &Search::default(),
+            &context(Some("ghostty"), Some("/tmp/game")),
+            &aliases(),
+            "where is the importer",
+            &mut results,
+        );
+
+        assert_eq!(results[0].hit.path.to_str().unwrap(), "/tmp/game/notes.md");
+        assert!(results[0].explain.current_project);
+    }
+
+    #[test]
+    fn an_app_named_in_the_query_beats_the_focused_window() {
+        // Asking about Blender while OBS happens to be focused should rank Blender notes
+        // first. Ambient focus is the weaker signal.
+        let mut results = ranked_paths(&["/tmp/obs.md", "/tmp/blender.md"]);
+        results[0].hit.body = "OBS crop filter.".into();
+        results[1].hit.body = "Blender mirror modifier.".into();
+        results[0].score = 1.0;
+        results[1].score = 1.0;
+
+        apply_context(
+            &Search::default(),
+            &context(Some("com.obsproject.Studio"), None),
+            &aliases(),
+            "how do I mirror bones in blender",
+            &mut results,
+        );
+
+        assert_eq!(results[0].hit.path.to_str().unwrap(), "/tmp/blender.md");
+    }
+
+    #[test]
+    fn an_alias_maps_a_wm_class_to_what_a_note_would_call_it() {
+        // `com.obsproject.Studio` is what X reports; nobody writes that in a note.
+        assert_eq!(
+            alias_for("com.obsproject.Studio", &aliases()).as_deref(),
+            Some("obs")
+        );
+        assert_eq!(alias_for("Ghostty", &aliases()).as_deref(), Some("ghostty"));
+    }
+
+    #[test]
+    fn a_reverse_dns_sub_identifier_still_matches_its_alias() {
+        // Observed live: ghostty's terminal window reports `com.mitchellh.ghostty.agent`,
+        // while the obvious config entry is `com.mitchellh.ghostty`. Requiring an exact
+        // match makes the alias table look correct and do nothing at all.
+        let aliases = BTreeMap::from([(
+            "ghostty".to_string(),
+            vec!["com.mitchellh.ghostty".to_string()],
+        )]);
+        assert_eq!(
+            alias_for("com.mitchellh.ghostty.agent", &aliases).as_deref(),
+            Some("ghostty")
+        );
+    }
+
+    #[test]
+    fn an_unaliased_app_falls_back_to_the_name_a_person_would_write() {
+        // Matching on the full reverse-DNS id would never fire against note text.
+        let empty = BTreeMap::new();
+        assert_eq!(alias_for("com.obsproject.Studio", &empty).as_deref(), Some("studio"));
+        assert_eq!(alias_for("com.mitchellh.ghostty.agent", &empty).as_deref(), Some("ghostty"));
+        assert_eq!(alias_for("Blender", &empty).as_deref(), Some("blender"));
+        assert_eq!(alias_for("", &empty), None);
+    }
+
+    #[test]
+    fn an_app_name_inside_a_longer_word_is_not_a_mention() {
+        // `obs` must not match `observability`, or every monitoring note gets boosted
+        // whenever OBS is open.
+        assert_eq!(app_named_in("observability dashboards", &aliases()), None);
+        assert_eq!(app_named_in("crop in obs", &aliases()).as_deref(), Some("obs"));
+    }
+
+    #[test]
+    fn an_empty_context_changes_nothing() {
+        let mut results = ranked_paths(&["/tmp/a.md", "/tmp/b.md"]);
+        let before: Vec<f32> = results.iter().map(|entry| entry.score).collect();
+
+        apply_context(
+            &Search::default(),
+            &brain_proto::DesktopContext::default(),
+            &aliases(),
+            "a question",
+            &mut results,
+        );
+
+        let after: Vec<f32> = results.iter().map(|entry| entry.score).collect();
+        assert_eq!(before, after);
     }
 
     #[tokio::test]

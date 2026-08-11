@@ -40,11 +40,11 @@ everything after that as optional increments, each independently shippable.
 | 0 | [`01-stage-0-dock.md`](01-stage-0-dock.md) | ✅ **done** — `$mod+a` shows a focused, floating, top-right dock with a streamed mock answer |
 | 1 | [`02-stage-1-index-search.md`](02-stage-1-index-search.md) | ✅ **done** — ask a question, get the right section ranked first, jump to its line |
 | 2 | [`03-stage-2-llm.md`](03-stage-2-llm.md) | ✅ **done** — grounded streamed answer from Qwen3, TTFT 24 ms p50 |
-| 3 | [`04-stage-3-actions.md`](04-stage-3-actions.md) | `Alt+1..9` jumps to note, code, video timestamp, app, project |
-| 4 | [`05-stage-4-context.md`](05-stage-4-context.md) | Same query ranks differently depending on the focused window |
+| 3 | [`04-stage-3-actions.md`](04-stage-3-actions.md) | ✅ **done** — `Alt+1..9` jumps to note, code, video timestamp, app, project |
+| 4 | [`05-stage-4-context.md`](05-stage-4-context.md) | ✅ **done** — same query ranks differently depending on the focused window |
 | 5 | [`06-stage-5-semantic.md`](06-stage-5-semantic.md) | Paraphrases retrieve the right note |
 | 6 | [`07-stage-6-corrections.md`](07-stage-6-corrections.md) | Correct once; similar future questions use the correction |
-| 7 | [`08-stage-7-benchmark.md`](08-stage-7-benchmark.md) | Recall/MRR/latency numbers gate every further change |
+| 7 | [`08-stage-7-benchmark.md`](08-stage-7-benchmark.md) | 🟨 harness built and gating; needs ~40 rated questions to tune with |
 | — | [`09-decisions.md`](09-decisions.md) | Stack rationale, deviations from the spec, open risks |
 
 **Stages 0–2 are the product.** If that slice does not feel good, stop and rethink rather

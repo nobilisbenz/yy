@@ -168,7 +168,7 @@ impl Index {
         let inner = Arc::clone(&self.inner);
         tokio::task::spawn_blocking(move || {
             let reader = inner.checkout()?;
-            let hits = reader.search(&query, weights, limit);
+            let hits = reader.search(&query, weights, limit, &inner.vault);
             inner.checkin(reader);
             hits
         })
@@ -239,14 +239,23 @@ struct Reader {
 }
 
 impl Reader {
-    fn search(&self, query: &str, weights: fts::Bm25Weights, limit: usize) -> Result<Vec<Hit>> {
+    fn search(
+        &self,
+        query: &str,
+        weights: fts::Bm25Weights,
+        limit: usize,
+        vault: &Path,
+    ) -> Result<Vec<Hit>> {
         // `None` means the query has no searchable token in it. That is an empty result,
         // not an error and not the whole vault.
         let Some(expression) = fts::expression_with(query, fts::Mode::Any) else {
             return Ok(Vec::new());
         };
         let rows = self.database.search_expression(&expression, weights, limit)?;
-        Ok(rows.into_iter().map(Hit::from).collect())
+        Ok(rows
+            .into_iter()
+            .map(|row| Hit::from_row(row, vault))
+            .collect())
     }
 }
 
@@ -374,6 +383,28 @@ mod tests {
             .await
             .unwrap();
         assert!(hits.iter().any(|hit| hit.section_uid == "obs#follow"));
+    }
+
+    /// A hit's path must be openable, not merely printable.
+    ///
+    /// `yalive` stores `files.path` relative to the vault. Everything downstream — the
+    /// `exists()` check that decides whether a button is enabled, and the argv handed to
+    /// nvim — treats it as a path to open, and a relative one resolves against the daemon's
+    /// working directory. The symptom was every `[Note]` button rendering disabled.
+    #[tokio::test]
+    async fn a_hit_carries_a_path_that_can_actually_be_opened() {
+        let dir = sample();
+        let index = Index::open(dir.path()).unwrap();
+        index.reindex().await.unwrap();
+
+        let hits = index
+            .search("crop".into(), fts::Bm25Weights::default(), 5)
+            .await
+            .unwrap();
+        let hit = hits.first().expect("no hits");
+
+        assert!(hit.path.is_absolute(), "{} is relative", hit.path.display());
+        assert!(hit.path.exists(), "{} does not exist", hit.path.display());
     }
 
     #[tokio::test]

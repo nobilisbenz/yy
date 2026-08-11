@@ -473,6 +473,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "brain-bench"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "brain-core",
+ "brain-engine",
+ "brain-index",
+ "brain-proto",
+ "clap",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tempfile",
+ "tokio",
+ "toml",
+]
+
+[[package]]
 name = "brain-core"
 version = "0.1.0"
 dependencies = [
@@ -496,6 +514,7 @@ dependencies = [
  "brain-engine",
  "brain-index",
  "brain-proto",
+ "brain-x11",
  "clap",
  "serde_json",
  "tempfile",
@@ -504,6 +523,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "x11rb 0.14.0",
 ]
 
 [[package]]
@@ -590,13 +610,16 @@ name = "brainctl"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "brain-bench",
  "brain-core",
  "brain-engine",
  "brain-proto",
  "clap",
  "serde_json",
+ "serde_yaml",
  "tokio",
  "uuid",
+ "yalive",
 ]
 
 [[package]]

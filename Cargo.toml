@@ -16,6 +16,7 @@ brain-proto = { path = "crates/brain-proto" }
 brain-index = { path = "crates/brain-index" }
 brain-engine = { path = "crates/brain-engine" }
 brain-x11 = { path = "crates/brain-x11" }
+brain-bench = { path = "crates/brain-bench" }
 
 # The vault engine: schema, parser, section identity, and the shared graph.
 # `yy` is a separate workspace inside the same repository, so this reaches up one level.
@@ -33,6 +34,9 @@ futures-util = { version = "0.3", features = ["sink"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.9"
+# The benchmark question set is YAML per the plan; this is the same version `yalive`
+# already uses for front matter, so there is one YAML stack in the tree rather than two.
+serde_yaml = "0.9"
 
 # errors / logging
 thiserror = "2"

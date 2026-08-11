@@ -18,6 +18,7 @@ use anyhow::{Context as _, Result};
 use brain_core::{ActionId, Config, SectionId};
 use brain_engine::actions::{Action, ActionError};
 use brain_engine::llm::{Chunk, Llm, ModelState};
+use brain_engine::desktop::DesktopIndex;
 use brain_engine::store::{Rating, Store};
 use brain_engine::{Ranked, actions, prompt, store};
 use brain_index::{Index, IndexStats, Watcher};
@@ -55,6 +56,9 @@ pub struct Backend {
     recent: Mutex<VecDeque<(Uuid, Vec<Action>)>>,
     /// Provenance row id per query, so a rating keystroke can find what it refers to.
     provenance: Mutex<VecDeque<(Uuid, i64)>>,
+    /// Installed applications, for resolving `@app`. Scanned once at startup: the set
+    /// changes when something is installed, which is rare next to how often it is read.
+    apps: DesktopIndex,
     /// Held so the watch lives as long as the daemon. Dropping it stops the watch.
     _watcher: Option<Watcher>,
 }
@@ -114,6 +118,7 @@ impl Backend {
             config,
             index,
             llm,
+            apps: DesktopIndex::scan(),
             store,
             recent: Mutex::new(VecDeque::new()),
             provenance: Mutex::new(VecDeque::new()),
@@ -165,6 +170,7 @@ impl Backend {
         id: Uuid,
         text: String,
         retrieval_only: bool,
+        context: brain_proto::DesktopContext,
         events: UnboundedSender<ServerEvent>,
         cancel: CancellationToken,
     ) -> Option<TimingInfo> {
@@ -197,6 +203,19 @@ impl Backend {
 
         brain_engine::boost_heading_matches(&self.config.search, &text, &mut retrieval.results);
 
+        // Context boosts, never filters (spec §18). Applied after fusion so it reorders a
+        // full result set rather than shrinking it — asking something unrelated while
+        // Blender is focused must still return sensible results.
+        if self.config.context.enabled && !context.is_suppressed() {
+            brain_engine::apply_context(
+                &self.config.search,
+                &context,
+                &self.config.context.aliases,
+                &text,
+                &mut retrieval.results,
+            );
+        }
+
         let retrieval_ms = started.elapsed().as_millis() as u32;
         let _ = events.send(ServerEvent::RetrievalComplete {
             id,
@@ -223,7 +242,24 @@ impl Backend {
         }
 
         let sources: Vec<SourceRef> = retrieval.results.iter().map(source_ref).collect();
-        let built = actions::for_results(&retrieval.results);
+
+        // `@action` rows declared on the retrieved sections. A failure here costs the extra
+        // buttons, not the answer, so the implicit note action still stands.
+        let uids: Vec<String> = retrieval
+            .results
+            .iter()
+            .map(|entry| entry.hit.section_uid.clone())
+            .collect();
+        let declared = self
+            .index
+            .read(move |database| Ok(database.actions_for(&uids)?))
+            .await
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "could not read declared actions");
+                Vec::new()
+            });
+
+        let built = actions::for_results(&retrieval.results, &declared, &self.apps);
         let views = built.iter().map(Action::view).collect();
         self.remember(id, built);
 
@@ -575,7 +611,14 @@ mod tests {
         let id = Uuid::new_v4();
 
         backend
-            .query(id, "crop target".into(), true, tx, CancellationToken::new())
+            .query(
+                id,
+                "crop target".into(),
+                true,
+                Default::default(),
+                tx,
+                CancellationToken::new(),
+            )
             .await;
 
         let events = drain(&mut rx);
@@ -604,6 +647,7 @@ mod tests {
                 Uuid::new_v4(),
                 "crop target".into(),
                 true,
+                Default::default(),
                 tx,
                 CancellationToken::new(),
             )
@@ -637,6 +681,7 @@ mod tests {
                 Uuid::new_v4(),
                 "zzzznotinthevault".into(),
                 true,
+                Default::default(),
                 tx,
                 CancellationToken::new(),
             )
@@ -676,7 +721,14 @@ mod tests {
             let id = Uuid::new_v4();
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             backend
-                .query(id, "crop".into(), true, tx, CancellationToken::new())
+                .query(
+                    id,
+                    "crop".into(),
+                    true,
+                    Default::default(),
+                    tx,
+                    CancellationToken::new(),
+                )
                 .await;
             ids.push(id);
         }

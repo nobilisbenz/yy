@@ -1,0 +1,37 @@
+# Regression set for the frozen fixture vault (`tests/fixtures/vault/`).
+#
+# Deliberately *not* the tuning set. This one runs in `cargo test` with a Recall@3 floor, so
+# its job is to fail when a parser or ranking change breaks something — which means it has
+# to stay small, stable, and committed alongside the vault it queries.
+#
+# The tuning set is `retrieval.yaml`, exported from real usage with
+# `brainctl bench export`. Forty real questions beat four hundred invented ones, and none of
+# these six are a substitute for that.
+#
+# `expected` is a list of `section_uid`s. Any one of them in the top *k* counts as a hit,
+# because several sections can legitimately answer one question.
+
+- question: how do I stop the OBS crop from jittering?
+  expected: [obs-follow#smoothing]
+  note: >
+    The answer shares almost no vocabulary with the question — "jitter" appears in the
+    section it contradicts, not in the fix. Tests that the contradicts edge is walked.
+
+- question: obs cursor follow
+  expected: [obs-follow#root, obs-follow#smoothing]
+
+- question: how do I schedule a nightly postgres backup?
+  expected: [pg-backup#root]
+  note: A natural question, which returns nothing at all under AND-joined terms.
+
+- question: how long are backups kept?
+  expected: [pg-backup#retention]
+
+- question: wireguard without a coordinator
+  expected: [wireguard#root]
+
+- question: how do I deploy?
+  expected: [deploy-container#root]
+  note: >
+    The rsync note is marked obsolete and superseded. Ranking it first would be the
+    characteristic five-year-old-vault failure, so this question guards the status weights.

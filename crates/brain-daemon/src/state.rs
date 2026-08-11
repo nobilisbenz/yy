@@ -16,6 +16,35 @@ use brain_index::IndexStats;
 use brain_proto::{ServerEvent, StatusReport, TimingInfo};
 use tokio::sync::mpsc::UnboundedSender;
 
+/// Read the focused window, or an empty context if X11 is unavailable.
+///
+/// Best-effort by design: a failure here costs a ranking signal, never a query. Running
+/// headless, or on a machine with no X display at all, must simply mean no boosts.
+fn capture_context() -> brain_proto::DesktopContext {
+    let captured = (|| {
+        use x11rb::connection::Connection as _;
+        let (connection, screen) = x11rb::connect(None).ok()?;
+        let root = connection.setup().roots.get(screen)?.root;
+        let atoms = brain_x11::Atoms::intern(&connection).ok()?;
+        brain_x11::context::capture(&connection, &atoms, root).ok()
+    })();
+
+    match captured {
+        Some(context) => brain_proto::DesktopContext {
+            wm_class: context.wm_class,
+            window_title: context.window_title,
+            pid: context.pid,
+            process_name: context.process_name,
+            cwd: context.cwd,
+            workspace: context.workspace,
+        },
+        None => {
+            tracing::debug!("no desktop context available");
+            brain_proto::DesktopContext::default()
+        }
+    }
+}
+
 /// Outcome of a visibility request, so the caller can log what actually
 /// happened rather than what it asked for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +76,9 @@ struct Inner {
     model: ModelReport,
     /// `(total, good, bad)` provenance rows.
     provenance: (usize, usize, usize),
+    /// What was focused at the last summon. Queries that arrive without their own context —
+    /// `brainctl ask` from a terminal — use this.
+    context: brain_proto::DesktopContext,
 }
 
 /// What `brainctl status` says about generation.
@@ -81,6 +113,7 @@ impl Daemon {
                 counts: IndexStats::default(),
                 model: ModelReport::default(),
                 provenance: (0, 0, 0),
+                context: brain_proto::DesktopContext::default(),
             }),
         }
     }
@@ -153,11 +186,12 @@ impl Daemon {
         }
 
         let event = if visible {
-            // Desktop context is captured here in Stage 4; until then the dock
-            // gets an empty struct rather than a missing field.
-            ServerEvent::ShowDock {
-                context: Default::default(),
-            }
+            // Captured **here**, at the moment visibility flips and before the dock maps.
+            // A moment later the dock is itself the active window and the answer would
+            // always be "brain-dock" (spec §18).
+            let context = capture_context();
+            self.lock().context = context.clone();
+            ServerEvent::ShowDock { context }
         } else {
             ServerEvent::HideDock
         };
@@ -214,6 +248,11 @@ impl Daemon {
     /// Publish how much benchmark data has accumulated.
     pub fn record_provenance(&self, counts: (usize, usize, usize)) {
         self.lock().provenance = counts;
+    }
+
+    /// The context captured at the last summon.
+    pub fn context(&self) -> brain_proto::DesktopContext {
+        self.lock().context.clone()
     }
 
     pub fn status(&self) -> StatusReport {

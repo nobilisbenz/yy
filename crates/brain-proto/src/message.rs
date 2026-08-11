@@ -187,7 +187,24 @@ pub struct DesktopContext {
     pub workspace: Option<String>,
 }
 
+/// `wm_class` value meaning "rank without context", as distinct from "I have none".
+///
+/// A client with nothing to report sends an empty context and the daemon substitutes the
+/// last summon's. `brainctl ask --no-context` needs to say something stronger, and a
+/// sentinel is cheaper than a second field on every query.
+pub const NO_CONTEXT: &str = "\u{0}none";
+
 impl DesktopContext {
+    /// Did the caller ask for context ranking to be skipped?
+    pub fn is_suppressed(&self) -> bool {
+        self.wm_class.as_deref() == Some(NO_CONTEXT)
+    }
+
+    /// Nothing to report — the daemon may substitute what it captured at the last summon.
+    pub fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
+
     /// Coarse cache key. Bucketing on the full struct would mean the retrieval
     /// cache never hits, since window titles change constantly.
     pub fn cache_bucket(&self) -> String {

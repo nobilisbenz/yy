@@ -1,5 +1,34 @@
 # Stage 3 — Rich actions
 
+> **Status: the definition of done passes.** A note declaring all five kinds produces:
+>
+> ```text
+> Alt+1  OBS cursor follow   OpenFile   …/obs-follow.md:7
+> Alt+5  smoothing.rs        OpenFile   …/proj/src/smoothing.rs:1
+> Alt+6  does-not-exist.md   OpenFile   …/does-not-exist.md:3   (unavailable)
+> Alt+7  ▶ 06:54             OpenVideo  https://www.youtube.com/watch?v=ABCDEF @06:54
+> Alt+8  Ghostty             LaunchDesktopApp  ghostty_ghostty
+> Alt+9  proj                OpenProject       …/proj
+> ```
+>
+> The timestamp there was lifted out of `&t=6m54s` in the URL and the URL stored clean;
+> the broken `@file` is disabled rather than missing; `@app ghostty` resolved through the
+> `.desktop` index. `grep -rn 'RunShell|"sh", "-c"|Command::new("sh")'` finds only the two
+> comments explaining why no such thing exists.
+>
+> **Found while verifying:** every `[Note]` button was rendering *disabled*. `yalive` stores
+> `files.path` relative to the vault root, and everything downstream treats a `Hit`'s path as
+> something to open — so `exists()` was resolving against the daemon's working directory and
+> `Alt+1`, the keystroke this whole product is shaped around, would have opened nothing.
+> Fixed at the one place that knows the vault, with a test that the path is absolute *and*
+> exists.
+>
+> Two deviations from what is written below. The video handler is configured under
+> `[openers] video` rather than a new `[actions.video]` table, since the fallback chain
+> (configured → mpv → xdg-open) makes a separate `fallback` key redundant. And `CopyText` is
+> not implemented — `Ctrl+C` already copies the answer, and no `@action` syntax produces a
+> copyable snippet.
+
 **Goal:** one answer can jump into a note, a video at a timestamp, a code file at a line,
 an application, or a project — without typing another command.
 

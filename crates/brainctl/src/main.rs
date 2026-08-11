@@ -4,6 +4,7 @@
 //! silent no-op when the daemon is down would look exactly like a broken
 //! keybinding, and you would go looking in the wrong place.
 
+use std::path::PathBuf;
 use std::process::ExitCode;
 
 use anyhow::{Context, Result};
@@ -31,6 +32,12 @@ enum Command {
         /// Retrieve and print sources without generating an answer.
         #[arg(long)]
         no_llm: bool,
+        /// Ignore what was focused when ranking.
+        ///
+        /// When context ranking misfires, the only way to confirm that is what happened is
+        /// to turn it off and ask the same thing again (spec §18).
+        #[arg(long)]
+        no_context: bool,
     },
     /// Print daemon diagnostics (spec §38).
     Status,
@@ -56,6 +63,23 @@ enum Command {
         /// want very different run counts to say anything useful.
         #[arg(long)]
         generate: bool,
+    },
+    /// Turn rated answers into a benchmark question set.
+    ///
+    /// The alternative is sitting down and inventing 30–50 questions with known-correct
+    /// sections. These come from what was actually asked, and the label is the set of
+    /// sections that produced an answer marked good — which is strictly better data and
+    /// arrives as a side effect of using the tool (`PLAN.md` §6.3).
+    BenchExport {
+        /// Where to write the YAML. Defaults to stdout.
+        #[arg(long)]
+        out: Option<PathBuf>,
+        /// Refuse to write fewer than this many questions.
+        ///
+        /// A benchmark of six real questions is worse than no benchmark, because it looks
+        /// like evidence and moves on noise.
+        #[arg(long, default_value_t = 20)]
+        min_questions: usize,
     },
     /// Check the environment: config, socket, compositor, openers.
     Doctor,
@@ -102,6 +126,9 @@ async fn run(command: Command) -> Result<()> {
     match command {
         Command::Doctor => return doctor().await,
         Command::Sources => return print_sources(),
+        Command::BenchExport { out, min_questions } => {
+            return export_benchmark(out.as_deref(), min_questions);
+        }
         _ => {}
     }
 
@@ -135,20 +162,32 @@ async fn run(command: Command) -> Result<()> {
         } => {
             return bench(&mut connection, queries, runs, generate).await;
         }
-        Command::Ask { query, no_llm } => {
+        Command::Ask {
+            query,
+            no_llm,
+            no_context,
+        } => {
             let text = query.join(" ");
             anyhow::ensure!(!text.trim().is_empty(), "no question given");
             connection
                 .send(&ClientRequest::Query {
                     id: Uuid::new_v4(),
                     text,
-                    context: Default::default(),
+                    // An empty context means "use the last summon's"; the daemon cannot
+                    // tell that from "I deliberately want none", so say which.
+                    context: if no_context {
+                        suppressed_context()
+                    } else {
+                        Default::default()
+                    },
                     retrieval_only: no_llm,
                 })
                 .await?;
             return stream_answer(&mut connection).await;
         }
-        Command::Doctor | Command::Sources => unreachable!("handled above"),
+        Command::Doctor | Command::Sources | Command::BenchExport { .. } => {
+            unreachable!("handled above")
+        }
     }
 
     // Fire-and-forget commands still need the write to reach the kernel before
@@ -248,6 +287,25 @@ async fn stream_answer(connection: &mut ClientConnection) -> Result<()> {
                     if !source.explain.is_empty() {
                         println!("    {}", source.explain);
                     }
+                }
+                if !items.is_empty() {
+                    println!();
+                }
+                saw_output = true;
+            }
+            // What `Alt+1..9` would do. Printed because it is the only way to check the
+            // action pipeline without a running dock, and because a disabled button is a
+            // note that needs fixing.
+            ServerEvent::Actions { items, .. } => {
+                for (index, action) in items.iter().enumerate() {
+                    let state = if action.enabled { "" } else { "  (unavailable)" };
+                    println!(
+                        "Alt+{}  {:<20} {:?}  {}{state}",
+                        index + 1,
+                        action.label,
+                        action.kind,
+                        action.detail
+                    );
                 }
                 if !items.is_empty() {
                     println!();
@@ -520,6 +578,109 @@ fn count_matching(source: &brain_core::Source) -> Result<usize> {
     Ok(count)
 }
 
+/// Write a benchmark question set from the answers marked good.
+///
+/// Only `good` rows become questions. A `bad` rating says the retrieved sections were the
+/// wrong ones, so it is a record of a failure rather than a label — using it would assert
+/// that the wrong answer is correct.
+fn export_benchmark(out: Option<&std::path::Path>, min_questions: usize) -> Result<()> {
+    let path = brain_engine::store::Store::default_path()
+        .context("could not locate the store")?;
+    let store = brain_engine::store::Store::open(&path)?;
+
+    let rated = store.rated()?;
+    let questions: Vec<brain_bench::Question> = rated
+        .into_iter()
+        .filter(|row| row.rating.is_some_and(|rating| rating > 0))
+        .filter(|row| !row.section_uids.is_empty())
+        .map(|row| brain_bench::Question {
+            question: row.query,
+            expected: row.section_uids,
+            context: None,
+            note: None,
+        })
+        .collect();
+
+    anyhow::ensure!(
+        questions.len() >= min_questions,
+        "only {} rated answer(s) so far; a set this small looks like evidence and moves on \
+         noise. Keep using the dock and rating answers with Ctrl+G, or pass \
+         --min-questions {}",
+        questions.len(),
+        questions.len().max(1)
+    );
+
+    let yaml = serde_yaml::to_string(&questions)?;
+    let header = format!(
+        "# Exported from {} rated answers by `brainctl bench-export`.\n\
+         #\n\
+         # `expected` is the set of sections that produced an answer you marked good, so\n\
+         # these labels came from real questions rather than invented ones. Hand-correct\n\
+         # them: a good answer can still have retrieved one irrelevant section alongside\n\
+         # the right ones.\n\n",
+        questions.len()
+    );
+
+    match out {
+        Some(path) => {
+            std::fs::write(path, format!("{header}{yaml}"))?;
+            println!("wrote {} questions to {}", questions.len(), path.display());
+        }
+        None => print!("{header}{yaml}"),
+    }
+    Ok(())
+}
+
+/// A context that explicitly means "rank without context".
+///
+/// `DesktopContext::default()` is ambiguous — it is also what a client sends when it simply
+/// has nothing to report, and the daemon fills that in from the last summon. This marks the
+/// difference.
+fn suppressed_context() -> brain_proto::DesktopContext {
+    brain_proto::DesktopContext {
+        wm_class: Some(brain_proto::NO_CONTEXT.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Unresolved disagreements in the vault.
+///
+/// Not a pass/fail check — a contradiction is a note to write, not a broken install — so it
+/// is reported separately from the `ok`/`FAIL` lines and never changes the exit code. Two
+/// sections of your own vault that disagree, with nothing marking which one won, is exactly
+/// what makes the dock answer confidently and wrongly: whichever one BM25 happens to prefer
+/// becomes the truth.
+fn report_vault_health(config: &brain_core::Config) {
+    for source in config.vaults() {
+        let Ok(database) = yalive::db::Database::open(&source.path) else {
+            continue;
+        };
+        let Ok(pairs) = database.unresolved_contradictions() else {
+            continue;
+        };
+        if pairs.is_empty() {
+            println!("ok    vault {:?} has no unresolved contradictions", source.name);
+            continue;
+        }
+
+        println!(
+            "note  vault {:?} has {} unresolved contradiction(s):",
+            source.name,
+            pairs.len()
+        );
+        for pair in &pairs {
+            println!(
+                "      {} ({}) ⟷ {} ({})",
+                pair.left_heading,
+                pair.left_path.display(),
+                pair.right_heading,
+                pair.right_path.display()
+            );
+        }
+        println!("      mark one `status: obsolete`, or add `supersedes:: [[…]]` to the winner");
+    }
+}
+
 fn load_config() -> Result<brain_core::Config> {
     match std::env::var_os("BRAIN_CONFIG") {
         Some(path) => brain_core::Config::load_from(std::path::Path::new(&path)),
@@ -605,6 +766,8 @@ async fn doctor() -> Result<()> {
                     }
                 }
             }
+
+            report_vault_health(&config);
 
             // Check the openers actually configured, not a hardcoded list — a config
             // pointing at `kitty` should not fail because `ghostty` is missing.
