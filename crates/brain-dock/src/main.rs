@@ -11,9 +11,10 @@
 
 mod ipc;
 mod platform;
+mod stream;
 mod window;
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use anyhow::{Context, Result};
 use brain_proto::{ClientRequest, ServerEvent};
@@ -25,6 +26,13 @@ slint::include_modules!();
 thread_local! {
     /// UI-thread-only. See the module comment.
     static WINDOW: RefCell<Option<WindowController>> = const { RefCell::new(None) };
+
+    /// The query currently on screen. Events for any other are discarded.
+    static CURRENT_QUERY: Cell<Option<uuid::Uuid>> = const { Cell::new(None) };
+}
+
+fn current_query() -> Option<uuid::Uuid> {
+    CURRENT_QUERY.with(Cell::get)
 }
 
 #[derive(Parser, Debug)]
@@ -166,9 +174,101 @@ fn reassert_hidden(attempt: u32) {
 
 /// Apply a daemon event to the UI. Runs on the UI thread.
 fn apply(dock: &Dock, event: ServerEvent) {
+    // Drop anything belonging to a query we have moved on from. The daemon
+    // cancels superseded queries, but events already in flight still arrive.
+    if let Some(id) = event.query_id()
+        && Some(id) != current_query()
+    {
+        tracing::trace!(%id, "discarding event from a superseded query");
+        return;
+    }
+
     match event {
         ServerEvent::ShowDock { .. } => show(dock),
         ServerEvent::HideDock => hide(dock),
+
+        ServerEvent::QueryAccepted { id } => stream::begin(id),
+
+        ServerEvent::RetrievalStarted { .. } => {
+            dock.set_state(DockState::Searching);
+            dock.set_status_line("Searching…".into());
+        }
+
+        // Sources land before generation starts, so the path and the action
+        // buttons are on screen while the model is still warming up.
+        ServerEvent::Sources { items, .. } => {
+            let primary = items.first();
+            dock.set_source_path(
+                primary
+                    .map(|s| s.path.display().to_string())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            dock.set_source_heading(
+                primary
+                    .map(|s| s.heading_path.clone())
+                    .unwrap_or_default()
+                    .into(),
+            );
+            dock.set_extra_sources(items.len().saturating_sub(1) as i32);
+        }
+
+        ServerEvent::Actions { items, .. } => {
+            let actions: Vec<ActionItem> = items
+                .iter()
+                .map(|action| ActionItem {
+                    label: action.label.clone().into(),
+                    enabled: action.enabled,
+                })
+                .collect();
+            dock.set_actions(slint::ModelRc::new(slint::VecModel::from(actions)));
+            dock.set_selected_action(-1);
+        }
+
+        ServerEvent::GenerationStarted { .. } => {
+            dock.set_answer(Default::default());
+            dock.set_state(DockState::Answer);
+        }
+
+        ServerEvent::Token { id, text } => {
+            let weak = dock.as_weak();
+            stream::push(id, &text, move |answer| {
+                if let Some(dock) = weak.upgrade() {
+                    dock.set_answer(answer.into());
+                }
+            });
+        }
+
+        ServerEvent::Complete { timing, cache, .. } => {
+            let weak = dock.as_weak();
+            // Flush the last partial batch, or the answer loses its final words.
+            stream::flush(move |answer| {
+                if let Some(dock) = weak.upgrade() {
+                    dock.set_answer(answer.into());
+                }
+            });
+            dock.set_state(DockState::Answer);
+            tracing::info!(
+                retrieval_ms = timing.retrieval_ms,
+                ttft_ms = timing.ttft_ms,
+                total_ms = timing.total_ms,
+                tokens = timing.output_tokens,
+                answer_cached = cache.answer_hit,
+                "query complete"
+            );
+        }
+
+        ServerEvent::NoAnswer { closest, .. } => {
+            // A confident "not in your files" is a feature, not an error
+            // (spec §45). The model was never called.
+            dock.set_answer("I couldn't find a reliable answer in your indexed files.".into());
+            dock.set_state(DockState::NoAnswer);
+            if let Some(first) = closest.first() {
+                dock.set_source_path(first.path.display().to_string().into());
+                dock.set_source_heading(first.heading_path.clone().into());
+                dock.set_extra_sources(closest.len().saturating_sub(1) as i32);
+            }
+        }
 
         ServerEvent::Error { message, .. } => {
             tracing::warn!(message, "daemon reported an error");
@@ -176,7 +276,6 @@ fn apply(dock: &Dock, event: ServerEvent) {
             dock.set_state(DockState::Searching);
         }
 
-        // Query events arrive in C8.
         other => tracing::trace!(?other, "unhandled event"),
     }
 
@@ -227,12 +326,32 @@ fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<Cli
             if text.trim().is_empty() {
                 return;
             }
+
+            // Abandon whatever is running. The daemon supersedes it too, but
+            // saying so explicitly means a slow query stops costing tokens the
+            // moment the user asks something else.
+            if let Some(previous) = current_query() {
+                let _ = tx.send(ClientRequest::Cancel { id: previous });
+            }
+
+            let id = uuid::Uuid::new_v4();
+            CURRENT_QUERY.with(|cell| cell.set(Some(id)));
+            stream::begin(id);
+
             if let Some(dock) = weak.upgrade() {
                 dock.set_state(DockState::Searching);
                 dock.set_status_line("Searching…".into());
+                dock.set_answer(Default::default());
+                dock.set_source_path(Default::default());
+                dock.set_source_heading(Default::default());
+                dock.set_extra_sources(0);
+                dock.set_actions(slint::ModelRc::new(slint::VecModel::from(
+                    Vec::<ActionItem>::new(),
+                )));
             }
+
             let _ = tx.send(ClientRequest::Query {
-                id: uuid::Uuid::new_v4(),
+                id,
                 text: text.to_string(),
                 context: Default::default(),
                 retrieval_only: false,
@@ -258,7 +377,13 @@ fn wire_callbacks(dock: &Dock, to_daemon: tokio::sync::mpsc::UnboundedSender<Cli
     });
 
     dock.on_copy_answer(|| {
-        tracing::info!("copy (C9)");
+        // Copy what has actually streamed so far, not the last flushed batch:
+        // Ctrl+C mid-answer should give you everything you can see.
+        let answer = stream::current();
+        if answer.is_empty() {
+            return;
+        }
+        tracing::info!(chars = answer.len(), "copy answer (clipboard lands in C9)");
     });
 
     // Slint resizes the window as the answer grows. Keep the anchored edge

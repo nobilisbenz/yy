@@ -6,6 +6,7 @@
 //! is separate from the UI.
 
 mod listener;
+mod mock;
 mod session;
 mod state;
 

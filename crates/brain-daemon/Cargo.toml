@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [dependencies]
-brain-core = { workspace = true }
+brain-core.workspace = true
 brain-proto = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
@@ -15,6 +15,7 @@ tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
+tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

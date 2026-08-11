@@ -8,12 +8,15 @@
 //! during generation: a `Cancel` has to be readable while tokens are still
 //! streaming out.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Result;
 use brain_proto::{ClientRequest, ServerConnection, ServerEvent};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 use crate::state::{Daemon, Visibility};
 
@@ -34,6 +37,7 @@ pub async fn run(stream: UnixStream, daemon: Arc<Daemon>, mock: bool) -> Result<
     });
 
     let mut ui_token = None;
+    let mut running: HashMap<Uuid, CancellationToken> = HashMap::new();
 
     while let Some(message) = source.recv().await {
         let request = match message {
@@ -51,7 +55,12 @@ pub async fn run(stream: UnixStream, daemon: Arc<Daemon>, mock: bool) -> Result<
             }
         };
 
-        handle(request, &daemon, &events, &mut ui_token, mock);
+        handle(request, &daemon, &events, &mut ui_token, &mut running, mock);
+    }
+
+    // Nothing is listening any more, so stop paying for work nobody will see.
+    for (_, cancel) in running.drain() {
+        cancel.cancel();
     }
 
     if let Some(token) = ui_token {
@@ -69,7 +78,8 @@ fn handle(
     daemon: &Arc<Daemon>,
     events: &UnboundedSender<ServerEvent>,
     ui_token: &mut Option<u64>,
-    _mock: bool,
+    running: &mut HashMap<Uuid, CancellationToken>,
+    mock: bool,
 ) {
     match request {
         ClientRequest::Subscribe => {
@@ -92,16 +102,47 @@ fn handle(
         ClientRequest::PauseIndexing => daemon.set_indexing_paused(true),
         ClientRequest::ResumeIndexing => daemon.set_indexing_paused(false),
 
-        // Stage 1 and Stage 2 fill these in. Until then, say so plainly rather
-        // than accepting the request and going silent — a client waiting
-        // forever for tokens is much harder to diagnose than a refusal.
-        ClientRequest::Query { id, .. } => {
-            let _ = events.send(ServerEvent::Error {
-                id: Some(id),
-                message: "query pipeline not implemented yet (Stage 1)".into(),
-            });
+        ClientRequest::Query {
+            id,
+            text,
+            retrieval_only,
+            ..
+        } => {
+            // A new query supersedes whatever this connection had running.
+            // Without this, an abandoned query keeps streaming tokens that the
+            // dock has to discard by id — correct, but wasteful, and on a real
+            // model it holds a slot that the new query needs.
+            for (_, cancel) in running.drain() {
+                cancel.cancel();
+            }
+
+            if !mock {
+                let _ = events.send(ServerEvent::Error {
+                    id: Some(id),
+                    message: "query pipeline not implemented yet (Stage 1) — \
+                              run brain-daemon --mock to exercise the UI"
+                        .into(),
+                });
+                return;
+            }
+
+            let cancel = CancellationToken::new();
+            running.insert(id, cancel.clone());
+            tokio::spawn(crate::mock::run(
+                id,
+                text,
+                retrieval_only,
+                events.clone(),
+                cancel,
+            ));
         }
-        ClientRequest::Cancel { .. } => {}
+
+        ClientRequest::Cancel { id } => {
+            if let Some(cancel) = running.remove(&id) {
+                tracing::debug!(%id, "cancelled");
+                cancel.cancel();
+            }
+        }
         ClientRequest::Reindex => {
             let _ = events.send(ServerEvent::Error {
                 id: None,

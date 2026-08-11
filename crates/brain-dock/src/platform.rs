@@ -47,19 +47,32 @@ pub fn install(scale: f32) -> Result<()> {
         .context("selecting the winit backend — is a display server reachable?")
 }
 
-/// Slint guesses a scale factor from the display, and on this class of laptop
-/// panel it guesses 1.5 even when the X session is a plain unscaled 96 DPI.
-/// That would render the dock half again larger than every other window.
+/// Pin the scale factor.
 ///
-/// `SLINT_SCALE_FACTOR` is Slint's own documented override, so honour an
-/// existing value and only fill in the default.
+/// winit guesses 1.5 on this laptop panel even though the X session is a plain
+/// unscaled 96 DPI with no `Xft.dpi` set, which renders the dock half again
+/// larger than every other window.
+///
+/// Both variables are needed, and the reason is worth recording:
+///
+/// - `SLINT_SCALE_FACTOR` is applied only to the *initial* window attributes.
+///   It gets the window created at the right size and then stops mattering.
+/// - `WINIT_X11_SCALE_FACTOR` changes what winit itself reports, so every
+///   later resize uses it too. Without this one, the card is correct at 560px
+///   until the first answer arrives and then snaps to 840px — which is exactly
+///   the bug this pair fixes.
+///
+/// Honour anything the user has already set; these are the documented
+/// overrides and a HiDPI user may legitimately want a different value.
 fn apply_scale_factor(scale: f32) {
-    if std::env::var_os("SLINT_SCALE_FACTOR").is_some() {
-        tracing::debug!("SLINT_SCALE_FACTOR is already set; leaving it alone");
-        return;
+    for key in ["SLINT_SCALE_FACTOR", "WINIT_X11_SCALE_FACTOR"] {
+        if std::env::var_os(key).is_some() {
+            tracing::debug!(key, "already set; leaving it alone");
+            continue;
+        }
+        // SAFETY: called at the top of main, before any other thread exists
+        // and before the Slint backend reads it.
+        unsafe { std::env::set_var(key, scale.to_string()) };
     }
-    // SAFETY: called at the top of main, before any other thread exists and
-    // before the Slint backend reads it.
-    unsafe { std::env::set_var("SLINT_SCALE_FACTOR", scale.to_string()) };
     tracing::debug!(scale, "scale factor pinned");
 }
