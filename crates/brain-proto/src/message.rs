@@ -349,7 +349,7 @@ mod tests {
                 context: DesktopContext::default(),
             },
             ServerEvent::HideDock,
-            ServerEvent::Status(Box::new(StatusReport::default())),
+            ServerEvent::Status(Box::default()),
         ];
 
         for case in cases {

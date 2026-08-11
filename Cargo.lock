@@ -699,11 +699,13 @@ dependencies = [
  "brain-proto",
  "brain-x11",
  "clap",
+ "raw-window-handle",
  "slint",
  "slint-build",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
