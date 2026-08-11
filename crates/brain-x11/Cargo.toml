@@ -1,0 +1,12 @@
+[package]
+name = "brain-x11"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+x11rb = { workspace = true }
+raw-window-handle = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

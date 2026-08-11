@@ -1,0 +1,67 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+repository = "https://github.com/nabi/brain-dock"
+
+[workspace.dependencies]
+# internal
+brain-core = { path = "crates/brain-core" }
+brain-proto = { path = "crates/brain-proto" }
+brain-index = { path = "crates/brain-index" }
+brain-engine = { path = "crates/brain-engine" }
+brain-x11 = { path = "crates/brain-x11" }
+
+# async / runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+# `sink` is what provides SinkExt and Stream::split; it is not reliably on by
+# default once the feature graph is unified, so name it.
+futures-util = { version = "0.3", features = ["sink"] }
+
+# serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+
+# errors / logging
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# misc
+uuid = { version = "1", features = ["v4", "serde"] }
+etcetera = "0.11"
+clap = { version = "4", features = ["derive", "env"] }
+
+# ui
+slint = "1.17"
+slint-build = "1.17"
+i-slint-backend-winit = "1.17"
+
+# x11
+x11rb = { version = "0.14", features = ["randr"] }
+raw-window-handle = "0.6"
+
+# dev
+tempfile = "3"
+
+# Slint and its renderer are unusably slow in an unoptimised debug build, and
+# Stage 0 is nothing but iterating on UI feel. Build our own crates lightly and
+# every dependency at full speed.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
