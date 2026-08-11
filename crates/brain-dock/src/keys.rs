@@ -24,6 +24,11 @@ pub enum Command {
     SelectPreviousAction,
     /// `Alt+1..9`; carries a zero-based index.
     Activate(usize),
+    /// Mark the answer on screen good or bad.
+    ///
+    /// One keystroke, and after a fortnight of ordinary use the daemon has a labelled
+    /// retrieval benchmark built from the questions actually asked (`PLAN.md` §6.3).
+    Rate(bool),
 }
 
 impl Command {
@@ -38,6 +43,8 @@ impl Command {
             "history-next" => Self::HistoryNext,
             "action-next" => Self::SelectNextAction,
             "action-previous" => Self::SelectPreviousAction,
+            "rate-good" => Self::Rate(true),
+            "rate-bad" => Self::Rate(false),
             other => {
                 // `action-1` .. `action-9`, one-based in the UI because that is
                 // what the button labels show.

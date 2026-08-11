@@ -68,8 +68,13 @@ fn body_height(dock: &Dock) -> f32 {
         DockState::Input => {}
     }
 
-    if dock.source.is_some() {
+    if let Some(source) = &dock.source {
         height += line(tokens::FONT_META);
+        // `view::source_badge` stacks the explanation under the path, so it is a second
+        // line. Missing it here clips the window by exactly that much.
+        if !source.explain.is_empty() {
+            height += line(tokens::FONT_META) + tokens::GAP_TIGHT;
+        }
         blocks += 1;
     }
 

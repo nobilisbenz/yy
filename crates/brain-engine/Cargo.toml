@@ -13,6 +13,14 @@ yalive = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+rusqlite = { workspace = true }
+blake3 = { workspace = true }
+etcetera = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

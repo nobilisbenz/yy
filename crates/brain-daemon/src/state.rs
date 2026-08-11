@@ -44,6 +44,22 @@ struct Inner {
     /// status call behind a vault walk would make `brainctl status` hang exactly when it
     /// is most likely to be asked.
     counts: IndexStats,
+    model: ModelReport,
+    /// `(total, good, bad)` provenance rows.
+    provenance: (usize, usize, usize),
+}
+
+/// What `brainctl status` says about generation.
+///
+/// Held here rather than read from the backend on demand so `status` stays synchronous —
+/// and so a daemon started with `--mock`, which has no model at all, still has something
+/// coherent to report.
+#[derive(Debug, Clone, Default)]
+pub struct ModelReport {
+    pub name: Option<String>,
+    pub backend: Option<String>,
+    pub state: String,
+    pub context_tokens: Option<u32>,
 }
 
 pub struct Daemon {
@@ -63,6 +79,8 @@ impl Daemon {
                 indexing_paused: false,
                 last_query: None,
                 counts: IndexStats::default(),
+                model: ModelReport::default(),
+                provenance: (0, 0, 0),
             }),
         }
     }
@@ -188,16 +206,29 @@ impl Daemon {
         self.lock().counts = counts;
     }
 
+    /// Publish what the model is doing, for the same reason.
+    pub fn record_model(&self, model: ModelReport) {
+        self.lock().model = model;
+    }
+
+    /// Publish how much benchmark data has accumulated.
+    pub fn record_provenance(&self, counts: (usize, usize, usize)) {
+        self.lock().provenance = counts;
+    }
+
     pub fn status(&self) -> StatusReport {
         let inner = self.lock();
         StatusReport {
             daemon_version: env!("CARGO_PKG_VERSION").to_string(),
             uptime_seconds: self.started.elapsed().as_secs(),
-            // Populated in Stage 2.
-            llm_model: None,
-            llm_backend: None,
-            llm_state: "not configured".to_string(),
-            llm_context_tokens: None,
+            llm_model: inner.model.name.clone(),
+            llm_backend: inner.model.backend.clone(),
+            llm_state: if inner.model.state.is_empty() {
+                "not configured".to_string()
+            } else {
+                inner.model.state.clone()
+            },
+            llm_context_tokens: inner.model.context_tokens,
             indexed_documents: inner.counts.documents as u64,
             indexed_sections: inner.counts.sections as u64,
             // Stage 5, if the benchmark ever justifies embeddings at all.
@@ -207,6 +238,9 @@ impl Daemon {
             ui_connected: inner.ui.is_some(),
             dock_visible: inner.visible,
             last_query: inner.last_query,
+            answers_recorded: inner.provenance.0 as u64,
+            answers_rated_good: inner.provenance.1 as u64,
+            answers_rated_bad: inner.provenance.2 as u64,
         }
     }
 

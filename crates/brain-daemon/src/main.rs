@@ -60,6 +60,29 @@ async fn main() -> Result<()> {
         "brain-daemon ready"
     );
 
+    // Load the model in the background, and never await it here: the daemon has to be
+    // accepting connections and answering lexical queries while the model loads — and for
+    // the whole session if it never loads at all.
+    if let Some(backend) = backend.clone() {
+        let reporting = Arc::clone(&backend);
+        let daemon = Arc::clone(&daemon);
+
+        tokio::spawn(async move { backend.start_model().await });
+
+        // Publish what the model is doing on a timer rather than at transitions: the
+        // supervisor owns that state and can change it at any moment (a crash, a restart),
+        // and `status` has to be able to say so without reaching into it. Reporting
+        // `loaded` for a server that died ten minutes ago is the most confusing possible
+        // failure — the tool quietly does less and says nothing.
+        tokio::spawn(async move {
+            loop {
+                daemon.record_model(reporting.model_report());
+                daemon.record_provenance(reporting.provenance_counts());
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        });
+    }
+
     // Index in the background. Blocking startup on a vault walk would mean the dock cannot
     // be summoned until it finishes, which is the one thing the split process exists to
     // prevent (spec §3.1).

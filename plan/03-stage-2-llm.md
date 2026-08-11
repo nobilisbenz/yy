@@ -1,5 +1,39 @@
 # Stage 2 — Grounded answers from Qwen3
 
+> **Status: the definition of done passes.** Measured on the 50-note vault, Qwen3-1.7B
+> Q5_K_M on CUDA, llama.cpp build 10358:
+>
+> ```text
+> TTFT           p50  24 ms    p99  42 ms      (target: < 500 ms warm)
+> generation             155.6 tok/s          (llama-bench ceiling: 168 t/s)
+> total          p50 288 ms    p99 703 ms
+> retrieval      p50 0.4 ms
+> ```
+>
+> TTFT of 24 ms means the stable prompt prefix and `--cache-reuse 256` are working: almost
+> nothing is being reprefilled. The first query of a session costs 182 ms; every one after
+> it costs 24 ms.
+>
+> **This changes the case for speculative decoding** (`PLAN.md` §3.1). That idea was sized
+> against a predicted 2.1 s of generation for a 350-token answer. With
+> `max_output_tokens = 200` and a three-sentence contract, a real answer is ~90 tokens and
+> the whole query lands in ~300 ms. Drafting would still help, but it is now a few hundred
+> milliseconds off an already-sub-second path, against 400 MB of VRAM and a second model to
+> keep current. Decide it deliberately rather than by default.
+>
+> Landed: process supervision with health checks and backoff restart, the context pack with
+> real tokenizer counting, the versioned prompt, SSE streaming, `<think>` stripping, the
+> confidence gate, degradation to lexical-only, and `brainctl bench --generate`.
+>
+> The **answer cache** has since landed and is measured: a repeated question drops from
+> 618 ms to **3 ms**, and it renders whole rather than replayed token by token. The key
+> hashes the *packed sections' bodies*, so editing a note that fed an answer regenerates it
+> (verified: 3 ms cached → 158 ms TTFT after the edit) while appending an unrelated section
+> correctly keeps the hit.
+>
+> Still open: the in-memory **retrieval** cache (§2.5). Retrieval is 0.4 ms, so caching it
+> would save nothing measurable — it is listed as done-by-not-doing rather than skipped.
+
 **Goal:** question → retrieved sections → short grounded answer streaming into the dock.
 
 This closes the loop. Stages 0–2 together are the spec's "minimal vertical slice" (§60) and

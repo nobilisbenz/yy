@@ -20,6 +20,9 @@
 //! only asks each signal for an ordering, which is the thing both can honestly supply.
 
 pub mod actions;
+pub mod llm;
+pub mod prompt;
+pub mod store;
 
 use std::collections::HashMap;
 

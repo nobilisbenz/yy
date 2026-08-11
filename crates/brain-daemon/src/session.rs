@@ -150,7 +150,9 @@ fn handle(
                     let events = events.clone();
                     let daemon = Arc::clone(daemon);
                     tokio::spawn(async move {
-                        if let Some(timing) = backend.query(id, text, events, cancel).await {
+                        if let Some(timing) =
+                            backend.query(id, text, retrieval_only, events, cancel).await
+                        {
                             // Keep `brainctl status` honest about the last query. A
                             // cancelled query reports nothing rather than a truncated time.
                             daemon.record_query(timing);
@@ -186,6 +188,20 @@ fn handle(
                     id: Some(id),
                     message: error.to_string(),
                 });
+            }
+        }
+
+        ClientRequest::RateAnswer { id, good } => {
+            let Some(backend) = &services.backend else {
+                return;
+            };
+            let rating = if good {
+                brain_engine::store::Rating::Good
+            } else {
+                brain_engine::store::Rating::Bad
+            };
+            if let Err(error) = backend.rate(id, rating) {
+                tracing::warn!(%error, "could not record the rating");
             }
         }
 

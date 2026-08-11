@@ -39,7 +39,7 @@ everything after that as optional increments, each independently shippable.
 | — | [`10-kickoff.md`](10-kickoff.md) | **The first coding session, commit by commit** |
 | 0 | [`01-stage-0-dock.md`](01-stage-0-dock.md) | ✅ **done** — `$mod+a` shows a focused, floating, top-right dock with a streamed mock answer |
 | 1 | [`02-stage-1-index-search.md`](02-stage-1-index-search.md) | ✅ **done** — ask a question, get the right section ranked first, jump to its line |
-| 2 | [`03-stage-2-llm.md`](03-stage-2-llm.md) | Grounded streamed answer from Qwen3 over retrieved sections |
+| 2 | [`03-stage-2-llm.md`](03-stage-2-llm.md) | ✅ **done** — grounded streamed answer from Qwen3, TTFT 24 ms p50 |
 | 3 | [`04-stage-3-actions.md`](04-stage-3-actions.md) | `Alt+1..9` jumps to note, code, video timestamp, app, project |
 | 4 | [`05-stage-4-context.md`](05-stage-4-context.md) | Same query ranks differently depending on the focused window |
 | 5 | [`06-stage-5-semantic.md`](06-stage-5-semantic.md) | Paraphrases retrieve the right note |

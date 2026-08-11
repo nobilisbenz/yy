@@ -137,6 +137,14 @@ pub struct Search {
     pub bm25_body: f64,
     pub bm25_tags: f64,
 
+    /// Fused score the top result must reach before the model is called at all.
+    ///
+    /// This is the no-answer gate (spec §45), and it is deliberately *not* the model's
+    /// judgement: asking a 1.7B model whether its context answers the question gets "yes"
+    /// far too often. Kept permissive until the Stage 7 benchmark tunes it — a wrong "I
+    /// don't know" is more annoying than a weak answer with a visible source under it.
+    pub min_confidence: f32,
+
     pub status_weight: StatusWeight,
     pub context_boost: ContextBoost,
     pub fusion: Fusion,
@@ -155,6 +163,10 @@ impl Default for Search {
             bm25_heading_path: 4.0,
             bm25_body: 1.0,
             bm25_tags: 2.0,
+            // RRF scores sit around 1/(k+rank); with k = 60 a top hit is ~0.016. This
+            // floor therefore only rejects a result set that is empty or badly demoted by
+            // status weighting, which is the intent until the benchmark says otherwise.
+            min_confidence: 0.001,
             status_weight: StatusWeight::default(),
             context_boost: ContextBoost::default(),
             fusion: Fusion::default(),

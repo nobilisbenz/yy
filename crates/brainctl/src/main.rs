@@ -50,6 +50,12 @@ enum Command {
         /// Repetitions per query. The first run of each is discarded as a warm-up.
         #[arg(long, default_value_t = 20)]
         runs: usize,
+        /// Also generate, and report TTFT and tokens/sec.
+        ///
+        /// Off by default because generation is ~1000x slower than retrieval, so the two
+        /// want very different run counts to say anything useful.
+        #[arg(long)]
+        generate: bool,
     },
     /// Check the environment: config, socket, compositor, openers.
     Doctor,
@@ -122,8 +128,12 @@ async fn run(command: Command) -> Result<()> {
             // only way to see that the walk actually found anything.
             return print_status(&mut connection).await;
         }
-        Command::Bench { queries, runs } => {
-            return bench(&mut connection, queries, runs).await;
+        Command::Bench {
+            queries,
+            runs,
+            generate,
+        } => {
+            return bench(&mut connection, queries, runs, generate).await;
         }
         Command::Ask { query, no_llm } => {
             let text = query.join(" ");
@@ -194,6 +204,15 @@ async fn print_status(connection: &mut ClientConnection) -> Result<()> {
                 field("indexing", if report.indexing_paused { "paused".into() } else { "running".to_string() });
                 field("dock", if report.ui_connected { "connected".into() } else { "not connected".to_string() });
                 field("dock visible", report.dock_visible.to_string());
+                field(
+                    "answers recorded",
+                    format!(
+                        "{} ({} good, {} bad)",
+                        report.answers_recorded,
+                        report.answers_rated_good,
+                        report.answers_rated_bad
+                    ),
+                );
                 if let Some(t) = report.last_query {
                     field(
                         "last query",
@@ -280,7 +299,12 @@ const DEFAULT_BENCH_QUERIES: &[&str] = &[
 ///
 /// Retrieval only: generation is not wired yet, and mixing the two would report a number
 /// dominated by a stage that does not exist.
-async fn bench(connection: &mut ClientConnection, queries: Vec<String>, runs: usize) -> Result<()> {
+async fn bench(
+    connection: &mut ClientConnection,
+    queries: Vec<String>,
+    runs: usize,
+    generate: bool,
+) -> Result<()> {
     anyhow::ensure!(runs > 1, "need at least 2 runs; the first is a warm-up");
 
     let queries = if queries.is_empty() {
@@ -292,11 +316,23 @@ async fn bench(connection: &mut ClientConnection, queries: Vec<String>, runs: us
         queries
     };
 
-    println!("{:<40} {:>7} {:>7} {:>7} {:>7}", "query", "n", "p50", "p99", "max");
+    if generate {
+        println!(
+            "{:<34} {:>6} {:>9} {:>9} {:>9} {:>8}",
+            "query", "n", "p50 total", "p50 TTFT", "p99 TTFT", "tok/s"
+        );
+    } else {
+        println!("{:<40} {:>7} {:>7} {:>7} {:>7}", "query", "n", "p50", "p99", "max");
+    }
 
     let mut all = Vec::new();
+    let mut all_ttft = Vec::new();
+    let mut all_rates = Vec::new();
+
     for query in &queries {
         let mut samples = Vec::with_capacity(runs);
+        let mut ttfts = Vec::with_capacity(runs);
+        let mut rates = Vec::with_capacity(runs);
         let mut sources = 0;
 
         for run in 0..runs {
@@ -306,51 +342,105 @@ async fn bench(connection: &mut ClientConnection, queries: Vec<String>, runs: us
                     id: Uuid::new_v4(),
                     text: query.clone(),
                     context: Default::default(),
-                    retrieval_only: true,
+                    retrieval_only: !generate,
                 })
                 .await?;
 
-            let found = wait_for_complete(connection).await?;
+            let outcome = wait_for_complete(connection).await?;
             // Discard the first: it pays for the connection being cold and, on a fresh
-            // daemon, for the page cache. Reporting it would flatter or damn the run
-            // depending only on what ran before it.
+            // daemon, for the page cache and an unprimed KV cache. Reporting it would
+            // flatter or damn the run depending only on what ran before it.
             if run > 0 {
                 samples.push(started.elapsed().as_secs_f64() * 1000.0);
+                if outcome.timing.ttft_ms > 0 {
+                    ttfts.push(outcome.timing.ttft_ms as f64);
+                }
+                if outcome.timing.generation_ms > 0 && outcome.timing.output_tokens > 0 {
+                    rates.push(
+                        outcome.timing.output_tokens as f64
+                            / (outcome.timing.generation_ms as f64 / 1000.0),
+                    );
+                }
             }
-            sources = found;
+            sources = outcome.sources;
         }
 
         samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!(
-            "{:<40} {:>7} {:>6.1}ms {:>6.1}ms {:>6.1}ms   ({sources} sources)",
-            truncate(query, 40),
-            samples.len(),
-            percentile(&samples, 0.50),
-            percentile(&samples, 0.99),
-            samples.last().copied().unwrap_or(0.0),
-        );
+        ttfts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        if generate {
+            let mean_rate = if rates.is_empty() {
+                0.0
+            } else {
+                rates.iter().sum::<f64>() / rates.len() as f64
+            };
+            println!(
+                "{:<34} {:>6} {:>7.0}ms {:>7.0}ms {:>7.0}ms {:>8.1}",
+                truncate(query, 34),
+                samples.len(),
+                percentile(&samples, 0.50),
+                percentile(&ttfts, 0.50),
+                percentile(&ttfts, 0.99),
+                mean_rate,
+            );
+            all_rates.extend(rates);
+        } else {
+            println!(
+                "{:<40} {:>7} {:>6.1}ms {:>6.1}ms {:>6.1}ms   ({sources} sources)",
+                truncate(query, 40),
+                samples.len(),
+                percentile(&samples, 0.50),
+                percentile(&samples, 0.99),
+                samples.last().copied().unwrap_or(0.0),
+            );
+        }
         all.extend(samples);
+        all_ttft.extend(ttfts);
     }
 
     all.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    all_ttft.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
     println!(
         "\noverall  p50 {:.1} ms   p99 {:.1} ms   over {} samples",
         percentile(&all, 0.50),
         percentile(&all, 0.99),
         all.len()
     );
-    // The plan's Stage 1 target, stated so the number has something to mean.
-    println!("target   end-to-end query → UI under 100 ms");
+
+    if generate {
+        let mean_rate = if all_rates.is_empty() {
+            0.0
+        } else {
+            all_rates.iter().sum::<f64>() / all_rates.len() as f64
+        };
+        println!(
+            "TTFT     p50 {:.0} ms   p99 {:.0} ms          {:.1} tok/s generating",
+            percentile(&all_ttft, 0.50),
+            percentile(&all_ttft, 0.99),
+            mean_rate
+        );
+        // The spec's target, stated so the measured number has something to mean.
+        println!("target   TTFT under 500 ms warm");
+    } else {
+        println!("target   end-to-end query → UI under 100 ms");
+    }
     Ok(())
 }
 
-/// Wait for a query to finish, returning how many sources it produced.
-async fn wait_for_complete(connection: &mut ClientConnection) -> Result<usize> {
+/// What one benchmarked query produced.
+struct Outcome {
+    sources: usize,
+    timing: brain_proto::TimingInfo,
+}
+
+/// Wait for a query to finish, returning what it produced.
+async fn wait_for_complete(connection: &mut ClientConnection) -> Result<Outcome> {
     let mut sources = 0;
     while let Some(event) = connection.recv().await {
         match event? {
             ServerEvent::Sources { items, .. } => sources = items.len(),
-            ServerEvent::Complete { .. } => return Ok(sources),
+            ServerEvent::Complete { timing, .. } => return Ok(Outcome { sources, timing }),
             ServerEvent::Error { message, .. } => anyhow::bail!("{message}"),
             _ => {}
         }

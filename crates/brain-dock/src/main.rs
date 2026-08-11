@@ -48,12 +48,24 @@ pub enum DockState {
     NoAnswer,
 }
 
+/// Quiet period after a keystroke before retrieval runs.
+///
+/// 80 ms is comfortably under the threshold where typing feels laggy and comfortably over
+/// the interval between keystrokes at speed, so a fast typist sends one query per word
+/// rather than one per letter.
+const SEARCH_DEBOUNCE: std::time::Duration = std::time::Duration::from_millis(80);
+
 /// The retrieved source shown under the answer.
 pub struct Source {
     pub path: String,
     pub heading: String,
     /// Empty for a source with no vault identity; the graph panel skips those.
     pub section_uid: String,
+    /// Why this section was retrieved — `matched heading · 1 hop to contradicts`.
+    ///
+    /// A feature and the debugger for graph retrieval out of one implementation: when the
+    /// wrong section comes back, this says whether the seed or the expansion was at fault.
+    pub explain: String,
 }
 
 #[derive(Parser, Debug)]
@@ -119,6 +131,9 @@ pub enum Message {
     /// The XID, from `window::raw_id`. Adoption happens on receipt.
     Adopted(u64),
     QueryChanged(String),
+    /// The debounce after a keystroke has elapsed. Carries the generation it was
+    /// scheduled for, so only the most recent keystroke's timer does anything.
+    SearchDebounceElapsed(u64),
     Submit,
     /// A named shortcut, resolved through `keys::Command`.
     Command(keys::Command),
@@ -190,6 +205,19 @@ pub struct Dock {
     /// lands in the next answer.
     current_query: Option<Uuid>,
     history: keys::History,
+
+    /// Bumped on every keystroke. A debounce timer only fires if the generation it was
+    /// scheduled for is still the current one, which is what makes the timers
+    /// self-cancelling without holding a handle to abort.
+    search_generation: u64,
+    /// The live retrieval-only query in flight, if any.
+    ///
+    /// Tracked apart from `current_query` because the two are cancelled at different
+    /// moments: a keystroke supersedes the previous *search*, but must not cancel the
+    /// generation the user already pressed Enter on.
+    live_query: Option<Uuid>,
+    /// What `live_query` was searching for, so an unchanged query is not re-sent.
+    live_text: String,
 }
 
 impl Dock {
@@ -220,6 +248,9 @@ impl Dock {
             graph_visible: false,
             current_query: None,
             history: keys::History::new(),
+            search_generation: 0,
+            live_query: None,
+            live_text: String::new(),
         }
     }
 
@@ -353,7 +384,16 @@ impl Dock {
 
             Message::QueryChanged(text) => {
                 self.query = text;
-                Task::none()
+                self.schedule_search()
+            }
+
+            Message::SearchDebounceElapsed(generation) => {
+                // A newer keystroke has already scheduled its own timer. Letting this one
+                // through would send a query for a prefix the user has moved past.
+                if generation != self.search_generation {
+                    return Task::none();
+                }
+                self.search_now()
             }
 
             Message::Submit => self.submit(),
@@ -508,6 +548,11 @@ impl Dock {
 
             ServerEvent::SetGraphVisible { visible } => self.set_graph_visible(visible),
 
+            // A live search must not repaint the dock as "searching…" on every keystroke.
+            // It resolves in well under a millisecond, so the spinner would be a flicker
+            // rather than feedback — and the previous results should stay on screen until
+            // the new ones replace them.
+            ServerEvent::RetrievalStarted { id } if self.live_query == Some(id) => {}
             ServerEvent::RetrievalStarted { .. } => {
                 self.state = DockState::Searching;
                 self.status_line = String::from("searching…");
@@ -528,9 +573,30 @@ impl Dock {
                 self.answer.clear();
                 self.state = DockState::Answer;
             }
+            // A finished live search leaves its sources on screen without claiming there is
+            // an answer to read — there is no prose, and Enter has not been pressed.
+            ServerEvent::Complete { id, .. } if self.live_query == Some(id) => {
+                self.live_query = None;
+                if self.state == DockState::Searching {
+                    self.state = DockState::Input;
+                }
+            }
             ServerEvent::Complete { timing, .. } => {
                 self.state = DockState::Answer;
                 tracing::debug!(total_ms = timing.total_ms, "query complete");
+            }
+            // Typing a word that matches nothing yet is the normal path through a query
+            // being typed, not a verdict on it. Saying "no reliable answer" mid-word would
+            // be wrong more often than right.
+            ServerEvent::NoAnswer { id, .. } if self.live_query == Some(id) => {
+                self.live_query = None;
+                self.source = None;
+                self.extra_sources = 0;
+                self.actions.clear();
+                self.selected_action = None;
+                if self.state == DockState::Searching {
+                    self.state = DockState::Input;
+                }
             }
             ServerEvent::NoAnswer { closest, .. } => {
                 // A confident "not in your files" is a feature, not a failure
@@ -559,6 +625,7 @@ impl Dock {
             path: first.path.display().to_string(),
             heading: first.heading_path.clone(),
             section_uid: first.section_uid.clone(),
+            explain: first.explain.clone(),
         });
         self.extra_sources = items.len().saturating_sub(1);
 
@@ -605,6 +672,76 @@ impl Dock {
         }
     }
 
+    /// Start the debounce after a keystroke.
+    ///
+    /// Retrieval is live (`09-decisions.md` §4): FTS5 answers in well under a millisecond,
+    /// so results while typing are effectively free, and they reframe the generated answer
+    /// as an addition to instant search rather than the only output. Enter stays reserved
+    /// for generation, which is the expensive half.
+    fn schedule_search(&mut self) -> Task<Message> {
+        self.search_generation = self.search_generation.wrapping_add(1);
+        let generation = self.search_generation;
+
+        if self.query.trim().is_empty() {
+            // Clearing the box clears the results with it, rather than leaving the last
+            // query's sources stranded under an empty input.
+            self.cancel_live_query();
+            self.live_text.clear();
+            self.source = None;
+            self.extra_sources = 0;
+            self.actions.clear();
+            self.selected_action = None;
+            if self.state == DockState::Searching {
+                self.state = DockState::Input;
+            }
+            return Task::none();
+        }
+
+        Task::perform(
+            async move {
+                tokio::time::sleep(SEARCH_DEBOUNCE).await;
+                generation
+            },
+            Message::SearchDebounceElapsed,
+        )
+    }
+
+    /// Issue the live, retrieval-only query.
+    fn search_now(&mut self) -> Task<Message> {
+        let text = self.query.trim().to_string();
+        if text.is_empty() || text == self.live_text {
+            // Typing and deleting a character lands back on the same query. Re-running it
+            // would repaint identical results for no reason.
+            return Task::none();
+        }
+
+        self.cancel_live_query();
+
+        let id = Uuid::new_v4();
+        self.live_query = Some(id);
+        self.live_text = text.clone();
+        self.current_query = Some(id);
+
+        self.send(ClientRequest::Query {
+            id,
+            text,
+            context: DesktopContext::default(),
+            retrieval_only: true,
+        });
+
+        Task::none()
+    }
+
+    /// Abandon the live search, if one is running.
+    ///
+    /// Deliberately does not touch a submitted query: pressing Enter and then typing must
+    /// not cancel the generation that Enter started.
+    fn cancel_live_query(&mut self) {
+        if let Some(previous) = self.live_query.take() {
+            self.send(ClientRequest::Cancel { id: previous });
+        }
+    }
+
     fn submit(&mut self) -> Task<Message> {
         let text = self.query.trim().to_string();
         if text.is_empty() {
@@ -612,6 +749,12 @@ impl Dock {
         }
 
         self.history.push(&text);
+
+        // A pending debounce would fire mid-generation and replace the answer's sources
+        // with its own. Bumping the generation makes that timer a no-op.
+        self.search_generation = self.search_generation.wrapping_add(1);
+        self.cancel_live_query();
+        self.live_text.clear();
 
         // Abandon whatever is running. The daemon supersedes it anyway, but
         // saying so explicitly means a slow query stops costing tokens the
@@ -675,6 +818,20 @@ impl Dock {
                 if index < self.actions.len() {
                     return self.dispatch(Message::ActivateAction(index));
                 }
+            }
+            Command::Rate(good) => {
+                let Some(id) = self.current_query else {
+                    return Task::none();
+                };
+                // Deliberately silent about whether it landed: the daemon may have
+                // forgotten the query, and a rating is a hint, not a transaction.
+                self.send(ClientRequest::RateAnswer { id, good });
+                self.status_line = if good {
+                    String::from("rated good")
+                } else {
+                    String::from("rated bad")
+                };
+                return Task::none();
             }
             Command::Retry => {
                 if !self.query.trim().is_empty() {
@@ -780,6 +937,139 @@ impl Dock {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A dock with no daemon connection. `send` drops requests when disconnected, so the
+    /// state machine can be driven directly without a socket or a running event loop.
+    fn dock() -> Dock {
+        Dock::new()
+    }
+
+    fn type_query(dock: &mut Dock, text: &str) {
+        dock.query = text.to_string();
+        let _ = dock.schedule_search();
+    }
+
+    #[test]
+    fn a_stale_debounce_does_not_search_for_a_prefix_the_user_typed_past() {
+        let mut dock = dock();
+        type_query(&mut dock, "wire");
+        let stale = dock.search_generation;
+        type_query(&mut dock, "wireguard");
+
+        // The timer scheduled for "wire" fires late. Honouring it would replace the
+        // results for "wireguard" with results for a prefix already moved past — the
+        // characteristic search-as-you-type bug.
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(stale));
+        assert!(dock.live_query.is_none(), "a stale timer issued a query");
+
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(dock.search_generation));
+        assert!(dock.live_query.is_some(), "the current timer issued nothing");
+        assert_eq!(dock.live_text, "wireguard");
+    }
+
+    #[test]
+    fn retyping_the_same_query_does_not_search_again() {
+        let mut dock = dock();
+        type_query(&mut dock, "wireguard");
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(dock.search_generation));
+        let first = dock.live_query;
+
+        // Typing a character and deleting it lands back on the same text.
+        type_query(&mut dock, "wireguardx");
+        type_query(&mut dock, "wireguard");
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(dock.search_generation));
+
+        assert_eq!(dock.live_query, first, "an unchanged query was re-sent");
+    }
+
+    #[test]
+    fn clearing_the_box_clears_the_results_with_it() {
+        let mut dock = dock();
+        type_query(&mut dock, "wireguard");
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(dock.search_generation));
+        dock.set_sources(&[source_ref("obs#root")]);
+        assert!(dock.source.is_some());
+
+        type_query(&mut dock, "");
+        assert!(dock.source.is_none(), "results outlived the query that found them");
+        assert!(dock.live_query.is_none());
+    }
+
+    #[test]
+    fn a_pending_debounce_cannot_disturb_a_submitted_query() {
+        // Type, then press Enter before the debounce elapses. The timer must not fire and
+        // replace the answer's sources with a live search's, and it must not cancel the
+        // generation Enter started.
+        let mut dock = dock();
+        type_query(&mut dock, "wireguard");
+        let pending = dock.search_generation;
+
+        let _ = dock.submit();
+        let submitted = dock.current_query.expect("Enter did not start a query");
+
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(pending));
+        assert!(dock.live_query.is_none(), "the stale debounce ran");
+        assert_eq!(
+            dock.current_query,
+            Some(submitted),
+            "the debounce displaced the submitted query"
+        );
+    }
+
+    #[test]
+    fn a_live_search_finishing_does_not_claim_there_is_an_answer() {
+        let mut dock = dock();
+        type_query(&mut dock, "wireguard");
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(dock.search_generation));
+        let live = dock.live_query.expect("no live query");
+
+        dock.state = DockState::Searching;
+        let _ = dock.on_server(ServerEvent::Complete {
+            id: live,
+            timing: Default::default(),
+            cache: Default::default(),
+        });
+
+        // `Answer` would render the empty answer body as though generation had produced
+        // nothing, rather than leaving the input alone with its sources under it.
+        assert_eq!(dock.state, DockState::Input);
+    }
+
+    #[test]
+    fn a_live_search_matching_nothing_is_silent_rather_than_a_verdict() {
+        let mut dock = dock();
+        type_query(&mut dock, "wireg");
+        let _ = dock.dispatch(Message::SearchDebounceElapsed(dock.search_generation));
+        let live = dock.live_query.expect("no live query");
+
+        let _ = dock.on_server(ServerEvent::NoAnswer {
+            id: live,
+            closest: Vec::new(),
+        });
+
+        // Mid-word, "no reliable answer in your notes" is wrong more often than right.
+        assert_ne!(dock.state, DockState::NoAnswer);
+        assert!(dock.answer.is_empty());
+    }
+
+    fn source_ref(uid: &str) -> SourceRef {
+        SourceRef {
+            section_id: brain_proto::SectionId(0),
+            section_uid: uid.into(),
+            path: "/tmp/a.md".into(),
+            heading_path: "A > B".into(),
+            start_line: 1,
+            end_line: 1,
+            score: 1.0,
+            snippet: String::new(),
+            explain: "matched heading".into(),
+        }
+    }
+}
+
 /// Window settings proven by the Stage 0′ spike (`plan/01-stage-0-dock.md` §0.0).
 fn window_settings() -> iced::window::Settings {
     iced::window::Settings {
@@ -842,6 +1132,10 @@ fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> 
             "l" => command("clear"),
             "c" => command("copy-answer"),
             "s" => command("show-sources"),
+            // Ctrl+Up / Ctrl+Down would collide with history; a thumbs pair on adjacent
+            // keys keeps rating a reflex rather than something to look up.
+            "g" => command("rate-good"),
+            "b" => command("rate-bad"),
             _ => None,
         };
     }

@@ -237,7 +237,21 @@ fn source_badge(source: &crate::Source, extra: usize, palette: Palette) -> Eleme
         );
     }
 
-    line.into()
+    if source.explain.is_empty() {
+        return line.into();
+    }
+
+    // Why this result, under which result. Faintest text in the card: it is there when you
+    // look for it and invisible when you are just reading the answer.
+    column![
+        line,
+        text(&source.explain)
+            .font(tokens::FONT)
+            .size(tokens::FONT_META)
+            .color(palette.fg_faint),
+    ]
+    .spacing(tokens::GAP_TIGHT)
+    .into()
 }
 
 fn action_row(dock: &Dock, palette: Palette) -> Element<'_, Message> {

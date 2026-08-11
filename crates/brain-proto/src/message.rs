@@ -39,6 +39,14 @@ pub enum ClientRequest {
     /// Abandon a running query. Idempotent; unknown ids are ignored.
     Cancel { id: Uuid },
 
+    /// Mark the answer to a query good or bad.
+    ///
+    /// One keystroke, and after a fortnight of ordinary use the daemon has a labelled
+    /// retrieval benchmark built from the questions actually asked — rather than 30–50
+    /// invented in one sitting (`PLAN.md` §6.3). Rating a query the daemon has forgotten is
+    /// a no-op, not an error.
+    RateAnswer { id: Uuid, good: bool },
+
     /// Run one of the actions the daemon offered for a query.
     ///
     /// The dock sends the action's id, never a command. The daemon resolves it against the
@@ -288,6 +296,17 @@ pub struct StatusReport {
     pub ui_connected: bool,
     pub dock_visible: bool,
     pub last_query: Option<TimingInfo>,
+    /// Answers recorded, and how many have been rated.
+    ///
+    /// The rated ones are the retrieval benchmark, accumulating from ordinary use rather
+    /// than from a labelling session (`PLAN.md` §6.3) — so this is the number that says
+    /// whether Phase D can be judged yet.
+    #[serde(default)]
+    pub answers_recorded: u64,
+    #[serde(default)]
+    pub answers_rated_good: u64,
+    #[serde(default)]
+    pub answers_rated_bad: u64,
 }
 
 #[cfg(test)]

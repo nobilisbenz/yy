@@ -53,6 +53,18 @@ globset = "0.4"
 notify = "8"
 notify-debouncer-full = "0.6"
 
+# inference
+# `rustls-tls` rather than the default native-tls: llama-server is on localhost so TLS is
+# not used at all, and pulling in openssl would add a system dependency for nothing.
+# `stream` is what gives `bytes_stream()` for reading SSE.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+
+# yy's own store: the answer cache and provenance rows. Separate from the vault index,
+# which `yalive` owns (PLAN.md §2.2) — these are `yy`'s data and have no business in a
+# vault's `.notes/`. Version pinned to match `yalive` so cargo unifies one SQLite build.
+rusqlite = { version = "0.37", features = ["bundled"] }
+blake3 = "1.8"
+
 # ui
 #
 # iced 0.14 pins wgpu 27, winit 0.30, raw-window-handle 0.6. yGraphy must match that

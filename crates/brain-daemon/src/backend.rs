@@ -17,7 +17,9 @@ use std::time::Instant;
 use anyhow::{Context as _, Result};
 use brain_core::{ActionId, Config, SectionId};
 use brain_engine::actions::{Action, ActionError};
-use brain_engine::{Ranked, actions};
+use brain_engine::llm::{Chunk, Llm, ModelState};
+use brain_engine::store::{Rating, Store};
+use brain_engine::{Ranked, actions, prompt, store};
 use brain_index::{Index, IndexStats, Watcher};
 use brain_proto::{CacheStatus, ServerEvent, SourceRef, TimingInfo};
 use tokio::sync::mpsc::UnboundedSender;
@@ -33,11 +35,26 @@ const REMEMBERED_QUERIES: usize = 8;
 /// Characters of body text sent as a preview.
 const SNIPPET: usize = 240;
 
+/// Tokens reserved for the system block and chat scaffolding.
+///
+/// [`brain_engine::prompt::SYSTEM`] is around 200 tokens; the rest is slack so a prompt
+/// never overflows and gets truncated **from the left**, which would remove the system
+/// block and look exactly like the model ignoring its instructions.
+const SCAFFOLD_TOKENS: usize = 320;
+
 pub struct Backend {
     config: Config,
     index: Index,
+    /// Generation. `None` is a normal, supported state — the daemon is a working lexical
+    /// search engine without it, which is the whole point of Stage 1 shipping first.
+    llm: Llm,
+    /// The answer cache and provenance rows. `None` when the store could not be opened —
+    /// a degraded but working daemon, since both are accelerations, not requirements.
+    store: Option<Store>,
     /// Actions by query, most recent last.
     recent: Mutex<VecDeque<(Uuid, Vec<Action>)>>,
+    /// Provenance row id per query, so a rating keystroke can find what it refers to.
+    provenance: Mutex<VecDeque<(Uuid, i64)>>,
     /// Held so the watch lives as long as the daemon. Dropping it stops the watch.
     _watcher: Option<Watcher>,
 }
@@ -77,12 +94,50 @@ impl Backend {
             }
         };
 
+        let llm = Llm::new(&config.llm);
+
+        // A store that cannot be opened costs the cache and the benchmark data, not the
+        // product. Saying so and carrying on beats refusing to start.
+        let store = Store::default_path()
+            .and_then(|path| match Store::open(&path) {
+                Ok(store) => {
+                    tracing::info!(path = %path.display(), "store ready");
+                    Some(store)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "continuing without the answer cache or provenance");
+                    None
+                }
+            });
+
         Ok(Self {
             config,
             index,
+            llm,
+            store,
             recent: Mutex::new(VecDeque::new()),
+            provenance: Mutex::new(VecDeque::new()),
             _watcher: watcher,
         })
+    }
+
+    /// Load the model, then keep it running for the life of the daemon.
+    ///
+    /// Called in the background at startup, never on the query path: the model loads at
+    /// daemon start and stays resident (spec §37). A failure leaves the daemon in
+    /// lexical-only mode rather than taking it down.
+    pub async fn start_model(&self) {
+        self.llm.supervise().await;
+    }
+
+    /// What to show in `brainctl status`.
+    pub fn model_report(&self) -> crate::state::ModelReport {
+        crate::state::ModelReport {
+            name: self.llm.model_name(),
+            backend: Some(self.config.llm.backend.clone()),
+            state: self.llm.state().as_str().to_string(),
+            context_tokens: Some(self.llm.context_tokens() as u32),
+        }
     }
 
     pub fn index(&self) -> &Index {
@@ -109,6 +164,7 @@ impl Backend {
         &self,
         id: Uuid,
         text: String,
+        retrieval_only: bool,
         events: UnboundedSender<ServerEvent>,
         cancel: CancellationToken,
     ) -> Option<TimingInfo> {
@@ -178,6 +234,16 @@ impl Backend {
             tracing::info!(query = %text, results = retrieval.results.len(), "answered");
         }
 
+        // Search-as-you-type asks for retrieval only. Generating for a half-typed question
+        // would burn the GPU on prose nobody will read and hold the slot the real query
+        // needs a moment later.
+        let generation = if retrieval_only {
+            None
+        } else {
+            self.generate(id, &text, &retrieval.results, &events, &cancel)
+                .await
+        };
+
         let total_ms = started.elapsed().as_millis() as u32;
         tracing::debug!(
             seeds = retrieval.seed_count,
@@ -189,8 +255,13 @@ impl Backend {
             "query complete"
         );
 
+        let (prompt_ms, ttft_ms, output_tokens) = generation.unwrap_or_default();
         let timing = TimingInfo {
             retrieval_ms,
+            prompt_ms,
+            ttft_ms,
+            generation_ms: total_ms.saturating_sub(ttft_ms.max(retrieval_ms)),
+            output_tokens,
             total_ms,
             ..Default::default()
         };
@@ -200,6 +271,194 @@ impl Backend {
             cache: CacheStatus::default(),
         });
         Some(timing)
+    }
+
+    /// Generate the prose half, streaming tokens as they arrive.
+    ///
+    /// Returns `(prompt_ms, ttft_ms, output_tokens)`, or `None` when nothing was generated —
+    /// which is an ordinary outcome, not a failure. Every degradation path in
+    /// `plan/03-stage-2-llm.md` §2.6 lands here, and all of them leave the sources and
+    /// actions already on screen: the dock must never become unusable because inference
+    /// broke.
+    async fn generate(
+        &self,
+        id: Uuid,
+        question: &str,
+        results: &[Ranked],
+        events: &UnboundedSender<ServerEvent>,
+        cancel: &CancellationToken,
+    ) -> Option<(u32, u32, u32)> {
+        match self.llm.state() {
+            ModelState::Loaded => {}
+            ModelState::Loading => {
+                tracing::debug!("model still loading; answering with sources only");
+                return None;
+            }
+            ModelState::Disabled | ModelState::Failed => return None,
+        }
+
+        // The no-answer decision is made **here**, from retrieval confidence, before the
+        // model is called — never by asking a 1.7B model whether its own context answers
+        // the question, which it will say yes to far too often (spec §45).
+        if !prompt::is_confident(results, self.config.search.min_confidence) {
+            tracing::debug!("retrieval below the confidence threshold; not calling the model");
+            let _ = events.send(ServerEvent::NoAnswer {
+                id,
+                closest: results.iter().take(3).map(source_ref).collect(),
+            });
+            return None;
+        }
+
+        let prompt_started = Instant::now();
+        let budget = self
+            .llm
+            .context_tokens()
+            .saturating_sub(self.config.llm.max_output_tokens)
+            .saturating_sub(SCAFFOLD_TOKENS);
+
+        let mut pack = prompt::build(
+            question,
+            &results[..results.len().min(self.config.search.context_sections)],
+            budget,
+        );
+
+        // Count with the server's own tokenizer rather than trusting the estimate. An
+        // overflowing prompt is truncated from the left, taking the system block with it.
+        if let Ok(counted) = self.llm.count_tokens(&pack.user).await
+            && counted > budget
+        {
+            tracing::debug!(counted, budget, "prompt over budget; packing fewer sources");
+            let fewer = results.len().min(self.config.search.context_sections).max(2) - 1;
+            pack = prompt::build(question, &results[..fewer], budget);
+        }
+
+        let prompt_ms = prompt_started.elapsed().as_millis() as u32;
+
+        // Record what was retrieved before generating, so the row exists even if generation
+        // fails — the benchmark cares about the retrieved set, not the prose.
+        let packed: Vec<(String, String)> = results
+            .iter()
+            .take(pack.sources_used)
+            .map(|entry| (entry.hit.section_uid.clone(), entry.hit.body.clone()))
+            .collect();
+
+        if let Some(store) = &self.store {
+            let uids: Vec<String> = packed.iter().map(|(uid, _)| uid.clone()).collect();
+            match store.record(question, &uids, self.llm.model_name().as_deref()) {
+                Ok(row) => self.remember_provenance(id, row),
+                Err(error) => tracing::warn!(%error, "could not record provenance"),
+            }
+        }
+
+        let key = store::answer_key(
+            &packed,
+            self.llm.model_name().as_deref(),
+            prompt::PROMPT_VERSION,
+            self.config.llm.max_output_tokens,
+            self.config.llm.temperature,
+        );
+
+        // A cache hit renders **immediately**, not replayed token by token. Fake-streaming
+        // a cached answer is a lie that costs exactly as long as the lie is convincing.
+        if let Some(store) = &self.store
+            && let Ok(Some(answer)) = store.cached_answer(&key)
+        {
+            tracing::debug!("answer cache hit");
+            let _ = events.send(ServerEvent::GenerationStarted { id });
+            let _ = events.send(ServerEvent::Token { id, text: answer });
+            return Some((prompt_ms, 0, 0));
+        }
+
+        let _ = events.send(ServerEvent::GenerationStarted { id });
+
+        let generation_started = Instant::now();
+        let mut ttft_ms = 0;
+        let mut output_tokens = 0;
+        let mut answer = String::new();
+
+        let outcome = self
+            .llm
+            .generate(&pack, cancel, |chunk| match chunk {
+                Chunk::Token(text) => {
+                    if ttft_ms == 0 {
+                        ttft_ms = generation_started.elapsed().as_millis() as u32;
+                    }
+                    answer.push_str(&text);
+                    let _ = events.send(ServerEvent::Token { id, text });
+                }
+                Chunk::Done { output_tokens: n } => output_tokens = n,
+            })
+            .await;
+
+        if let Err(error) = outcome {
+            tracing::warn!(%error, "generation failed; the sources are still on screen");
+            // Deliberately not a `ServerEvent::Error`: the query did produce a useful
+            // result, and painting the card red would say otherwise.
+            return None;
+        }
+
+        // Only cache a completed answer. A cancelled or truncated one would be served in
+        // full next time, which is worse than regenerating it.
+        if let Some(store) = &self.store
+            && !answer.trim().is_empty()
+            && !cancel.is_cancelled()
+            && let Err(error) = store.store_answer(&key, &answer, self.llm.model_name().as_deref())
+        {
+            tracing::warn!(%error, "could not cache the answer");
+        }
+
+        tracing::info!(ttft_ms, output_tokens, "generated");
+        Some((prompt_ms, ttft_ms, output_tokens))
+    }
+
+    fn remember_provenance(&self, query: Uuid, row: i64) {
+        let mut provenance = self
+            .provenance
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        provenance.push_back((query, row));
+        while provenance.len() > REMEMBERED_QUERIES {
+            provenance.pop_front();
+        }
+    }
+
+    /// Mark the answer to a query good or bad.
+    ///
+    /// One keystroke in the dock, and after a fortnight of ordinary use it is a labelled
+    /// retrieval benchmark built from the questions actually asked — which is strictly
+    /// better data than a set invented in one sitting (`PLAN.md` §6.3).
+    pub fn rate(&self, query: Uuid, rating: Rating) -> Result<()> {
+        let row = {
+            let provenance = self
+                .provenance
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            provenance
+                .iter()
+                .find(|(id, _)| *id == query)
+                .map(|(_, row)| *row)
+        };
+
+        let Some(row) = row else {
+            // The daemon restarted, or the query aged out. Not worth an error.
+            tracing::debug!(%query, "rated a query the daemon no longer remembers");
+            return Ok(());
+        };
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+
+        store.rate(row, rating)?;
+        tracing::info!(?rating, "answer rated");
+        Ok(())
+    }
+
+    /// `(total, good, bad)` provenance rows, for `brainctl status`.
+    pub fn provenance_counts(&self) -> (usize, usize, usize) {
+        self.store
+            .as_ref()
+            .and_then(|store| store.counts().ok())
+            .unwrap_or_default()
     }
 
     fn remember(&self, id: Uuid, built: Vec<Action>) {
@@ -316,7 +575,7 @@ mod tests {
         let id = Uuid::new_v4();
 
         backend
-            .query(id, "crop target".into(), tx, CancellationToken::new())
+            .query(id, "crop target".into(), true, tx, CancellationToken::new())
             .await;
 
         let events = drain(&mut rx);
@@ -344,6 +603,7 @@ mod tests {
             .query(
                 Uuid::new_v4(),
                 "crop target".into(),
+                true,
                 tx,
                 CancellationToken::new(),
             )
@@ -376,6 +636,7 @@ mod tests {
             .query(
                 Uuid::new_v4(),
                 "zzzznotinthevault".into(),
+                true,
                 tx,
                 CancellationToken::new(),
             )
@@ -415,7 +676,7 @@ mod tests {
             let id = Uuid::new_v4();
             let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
             backend
-                .query(id, "crop".into(), tx, CancellationToken::new())
+                .query(id, "crop".into(), true, tx, CancellationToken::new())
                 .await;
             ids.push(id);
         }

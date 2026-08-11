@@ -17,4 +17,7 @@ pub use message::{
     ActionKind, ActionView, CacheStatus, ClientRequest, DesktopContext, ServerEvent, SourceRef,
     StatusReport, TimingInfo,
 };
+// The ids appear in this crate's public types, so anyone holding a `SourceRef` or an
+// `ActionView` needs to be able to name them without also depending on `brain-core`.
+pub use brain_core::{ActionId, SectionId};
 pub use socket::socket_path;
