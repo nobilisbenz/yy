@@ -1,0 +1,44 @@
+import { Tokens } from "../tokens.slint";
+
+// `blender/rigging.md · Mirror bones`
+//
+// One primary source, and a count when there are more (spec §44). Similarity
+// scores never appear here; they live in the debug view.
+export component SourceBadge inherits HorizontalLayout {
+    in property <string> path;
+    in property <string> heading;
+    in property <int> extra-count: 0;
+
+    spacing: Tokens.gap-tight;
+
+    Text {
+        text: root.path;
+        font-family: Tokens.font-family;
+        font-size: Tokens.font-meta;
+        color: Tokens.fg-dim;
+        overflow: elide;
+    }
+
+    if root.heading != "": Text {
+        text: "·";
+        font-size: Tokens.font-meta;
+        color: Tokens.fg-faint;
+    }
+
+    if root.heading != "": Text {
+        text: root.heading;
+        font-family: Tokens.font-family;
+        font-size: Tokens.font-meta;
+        color: Tokens.fg-dim;
+        overflow: elide;
+    }
+
+    if root.extra-count > 0: Text {
+        text: "  +" + root.extra-count + " more";
+        font-family: Tokens.font-family;
+        font-size: Tokens.font-meta;
+        color: Tokens.fg-faint;
+    }
+
+    Rectangle { horizontal-stretch: 1; }
+}

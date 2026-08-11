@@ -41,9 +41,17 @@ etcetera = "0.11"
 clap = { version = "4", features = ["derive", "env"] }
 
 # ui
-slint = "1.17"
+#
+# `unstable-winit-030` gives us BackendSelector::with_winit_window_attributes_hook,
+# the only way to set WM_CLASS *before* the window is first mapped — and i3's
+# `for_window` rules are evaluated at map time, so anything later is too late.
+#
+# `raw-window-handle-06` exposes the XID that brain-x11 drives.
+#
+# Both are explicitly unstable across minor Slint releases. If a bump breaks
+# them, the fallback is documented in plan/01-stage-0-dock.md §0.3.
+slint = { version = "1.17", features = ["unstable-winit-030", "raw-window-handle-06"] }
 slint-build = "1.17"
-i-slint-backend-winit = "1.17"
 
 # x11
 x11rb = { version = "0.14", features = ["randr"] }

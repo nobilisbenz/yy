@@ -1,0 +1,139 @@
+import { Tokens } from "tokens.slint";
+import { SearchInput } from "components/SearchInput.slint";
+import { AnswerText } from "components/AnswerText.slint";
+import { SourceBadge } from "components/SourceBadge.slint";
+import { ActionButton } from "components/ActionButton.slint";
+
+export struct ActionItem {
+    label: string,
+    enabled: bool,
+}
+
+// Spec §4's states, minus Hidden — hiding is an X11 unmap, not a UI state, so
+// the window has nothing to draw for it.
+export enum DockState {
+    input,
+    searching,
+    answer,
+    no-answer,
+}
+
+export component Dock inherits Window {
+    // --- window behaviour --------------------------------------------------
+    // Position, stacking, and stickiness are set through X11 in brain-x11;
+    // Slint only needs to know not to draw a frame. `background: transparent`
+    // is what lets picom round the corners and paint a shadow.
+    title: "Brain Dock";
+    no-frame: true;
+    always-on-top: true;
+    background: transparent;
+
+    width: Tokens.dock-width;
+    height: card.preferred-height;
+
+    // --- inbound state (set from Rust) -------------------------------------
+    in property <DockState> state: DockState.input;
+    in property <string> answer;
+    in property <string> status-line;
+    in property <string> source-path;
+    in property <string> source-heading;
+    in property <int> extra-sources: 0;
+    in property <[ActionItem]> actions: [];
+    in property <int> selected-action: -1;
+    in-out property <string> query <=> input.text;
+
+    // --- outbound events ---------------------------------------------------
+    callback submit(string);
+    callback edited(string);
+    callback dismiss();
+    callback activate-action(int);
+    callback copy-answer();
+    callback clear-query();
+
+    forward-focus: input;
+
+    card := Rectangle {
+        width: 100%;
+        background: Tokens.bg;
+        border-radius: Tokens.radius;
+        border-width: 1px;
+        border-color: Tokens.border;
+
+        VerticalLayout {
+            alignment: start;
+
+            input := SearchInput {
+                busy: root.state == DockState.searching;
+                accepted(text) => { root.submit(text); }
+                edited(text) => { root.edited(text); }
+                dismissed => { root.dismiss(); }
+            }
+
+            if root.state != DockState.input: Rectangle {
+                height: 1px;
+                background: Tokens.divider;
+            }
+
+            // The body expands downward; the top-right anchor stays put
+            // (spec §41).
+            if root.state != DockState.input: VerticalLayout {
+                padding: Tokens.pad-x;
+                padding-top: Tokens.pad-y;
+                padding-bottom: Tokens.pad-y;
+                spacing: Tokens.gap;
+
+                if root.state == DockState.searching: Text {
+                    text: root.status-line;
+                    font-family: Tokens.font-family;
+                    font-size: Tokens.font-answer;
+                    color: Tokens.fg-dim;
+                }
+
+                if root.state == DockState.answer || root.state == DockState.no-answer:
+                    AnswerText {
+                        text: root.answer;
+                        height: min(
+                            Tokens.answer-max-height,
+                            max(self.viewport-height, 1px)
+                        );
+                    }
+
+                if root.source-path != "": SourceBadge {
+                    path: root.source-path;
+                    heading: root.source-heading;
+                    extra-count: root.extra-sources;
+                }
+
+                if root.actions.length > 0: HorizontalLayout {
+                    spacing: Tokens.gap-tight;
+                    for action[i] in root.actions: ActionButton {
+                        label: action.label;
+                        enabled: action.enabled;
+                        index: i + 1;
+                        selected: root.selected-action == i;
+                        activated => { root.activate-action(i); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                }
+            }
+        }
+    }
+
+    // Keyboard paths that are not the text field's own (spec §5). Routed
+    // through one scope so the Rust side owns the mapping and can make it
+    // configurable later.
+    keys := FocusScope {
+        // Sits behind the input; the input takes precedence for typing.
+        width: 0px;
+        height: 0px;
+    }
+
+    public function focus-query() {
+        input.focus-input();
+        input.select-all();
+    }
+
+    public function clear() {
+        input.clear();
+    }
+}

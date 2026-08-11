@@ -1,0 +1,29 @@
+import { Tokens } from "../tokens.slint";
+
+// The streamed answer.
+//
+// Scrolls rather than growing without bound: the dock is anchored top-right
+// and a window that keeps extending downward eventually runs off the screen.
+export component AnswerText inherits Flickable {
+    in property <string> text;
+
+    viewport-width: self.width;
+    viewport-height: body.preferred-height;
+
+    body := Text {
+        width: parent.width;
+        text: root.text;
+        font-family: Tokens.font-family;
+        font-size: Tokens.font-answer;
+        color: Tokens.fg;
+        wrap: word-wrap;
+        // Slint takes line height as a multiplier of the font size.
+        letter-spacing: 0;
+    }
+
+    // Keep the newest text in view while tokens arrive. The user is reading the
+    // end of the answer, not the beginning.
+    public function scroll-to-end() {
+        self.viewport-y = min(0, self.height - body.preferred-height);
+    }
+}
