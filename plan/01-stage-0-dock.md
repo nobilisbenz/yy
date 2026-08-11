@@ -1,4 +1,18 @@
-# Stage 0 — The dock
+# Stage 0 — The dock ✅ complete
+
+> **Built and verified.** Commits C1–C9. Summon measured at 10–15 ms against a
+> 50 ms target. What running it changed, beyond what is written below:
+>
+> | Assumption here | Reality |
+> |---|---|
+> | `_NET_WORKAREA` gives the usable area | **i3 does not publish it.** Derived from `_NET_WM_STRUT_PARTIAL` instead — and dock windows are i3's *grandchildren*, so the tree walk needs 3 levels |
+> | `_NET_WM_STATE_ABOVE` keeps it on top | **i3 ignores it**, plus SKIP_TASKBAR/SKIP_PAGER. Floating + an explicit `ConfigureWindow` raise is what works |
+> | The XID is available after `show()` | Window creation is deferred to the first event-loop iteration; adoption retries on a timer |
+> | Slint hide/show might destroy the window | It does — and exits the event loop. Map/unmap confirmed correct |
+> | Transparency is the big risk | Works. Depth-32 ARGB visual, picom on `egl` |
+> | `SLINT_SCALE_FACTOR` pins the scale | Only at window creation. `WINIT_X11_SCALE_FACTOR` is needed for resizes too |
+> | `--hidden` just skips the map | Races Slint's own async map; window is parked off-screen and the state re-asserted |
+
 
 **Goal:** prove the interaction. `$mod+a` (Super+A) puts a focused, frameless, floating
 panel at the top-right of the active monitor, instantly, every time.

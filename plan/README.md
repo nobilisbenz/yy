@@ -37,7 +37,7 @@ everything after that as optional increments, each independently shippable.
 | — | [`00-setup.md`](00-setup.md) | Everything to install before writing code — **done** |
 | — | [`00b-machine-baseline.md`](00b-machine-baseline.md) | **Verified machine state + measured numbers. Read this first.** |
 | — | [`10-kickoff.md`](10-kickoff.md) | **The first coding session, commit by commit** |
-| 0 | [`01-stage-0-dock.md`](01-stage-0-dock.md) | Super+Space shows a focused, floating, top-right dock with a fake answer |
+| 0 | [`01-stage-0-dock.md`](01-stage-0-dock.md) | ✅ **done** — `$mod+a` shows a focused, floating, top-right dock with a streamed mock answer |
 | 1 | [`02-stage-1-index-search.md`](02-stage-1-index-search.md) | Type a question, jump to the right Markdown section in nvim |
 | 2 | [`03-stage-2-llm.md`](03-stage-2-llm.md) | Grounded streamed answer from Qwen3 over retrieved sections |
 | 3 | [`04-stage-3-actions.md`](04-stage-3-actions.md) | `Alt+1..9` jumps to note, code, video timestamp, app, project |
