@@ -70,11 +70,16 @@ impl Watcher {
             None,
             move |result: DebounceEventResult| match result {
                 Ok(events) => {
-                    let relevant = events
+                    let trigger = events
                         .iter()
+                        .filter(|event| is_content_change(&event.kind))
                         .flat_map(|event| event.paths.iter())
-                        .any(|path| is_relevant(path, &watched));
-                    if relevant {
+                        .find(|path| is_relevant(path, &watched));
+                    if let Some(path) = trigger {
+                        // Logged because the failure mode here is a *loop*: a path that
+                        // should have been filtered triggers a reindex, whose own writes
+                        // trigger the next one. This line names the culprit immediately.
+                        tracing::debug!(path = %path.display(), "reindexing because of");
                         // Full means "a reindex is already pending", which is the same
                         // outcome. Dropping it is correct, not a lost update.
                         let _ = sender.try_send(());
@@ -102,12 +107,49 @@ impl Watcher {
     }
 }
 
+/// Did this event change content, or merely observe it?
+///
+/// **This is the one that matters.** inotify reports reads as `IN_ACCESS`, so indexing the
+/// vault — which reads every file in it — generates an access event per note. Treating
+/// those as changes means every reindex schedules the next one, and the daemon reindexes
+/// forever at the debounce interval, pinning a core and never settling. Measured: with
+/// access events included, a 50-note vault reindexed ~10 times a second indefinitely.
+///
+/// Metadata-only changes are excluded for the same reason — reading a file updates its
+/// atime, which is a metadata change that says nothing about its contents.
+fn is_content_change(kind: &notify::EventKind) -> bool {
+    use notify::EventKind;
+    use notify::event::ModifyKind;
+
+    match kind {
+        EventKind::Create(_) | EventKind::Remove(_) => true,
+        EventKind::Modify(ModifyKind::Metadata(_)) => false,
+        EventKind::Modify(_) => true,
+        // `Any`/`Other` are what a platform backend emits when it cannot classify an
+        // event. Reindexing is cheap and idempotent, so erring toward it is right — but
+        // `Access` is never worth it.
+        EventKind::Any | EventKind::Other => true,
+        EventKind::Access(_) => false,
+    }
+}
+
 /// Is this path worth reindexing for?
 ///
 /// Excludes our own sidecar index, which is what stops the watch from feeding itself, and
 /// the usual directories that produce enormous event volume and no prose.
 fn is_relevant(path: &Path, vault: &Path) -> bool {
-    let relative = path.strip_prefix(vault).unwrap_or(path);
+    let Ok(relative) = path.strip_prefix(vault) else {
+        // Outside the vault entirely. Should not happen on a watch rooted there, and
+        // reindexing for it would be acting on something we know nothing about.
+        return false;
+    };
+
+    // The vault root itself. Its mtime changes whenever anything inside it does, and the
+    // event for the file that actually changed is the one worth acting on.
+    if relative.as_os_str().is_empty() {
+        return false;
+    }
+
     !relative.components().any(|component| {
         let name = component.as_os_str();
         name == SIDECAR || name == ".git" || name == "target" || name == "node_modules"
@@ -142,6 +184,41 @@ mod tests {
 
         assert!(is_relevant(&vault.join("obs.md"), vault));
         assert!(is_relevant(&vault.join("deep/nested/note.md"), vault));
+
+        // The vault root itself. Its mtime moves whenever anything inside it does, so
+        // acting on it means reindexing twice for every change — and it was one of the two
+        // paths that made the daemon reindex in a loop.
+        assert!(!is_relevant(vault, vault));
+        assert!(!is_relevant(Path::new("/somewhere/else/note.md"), vault));
+    }
+
+    /// Reading the vault must not look like changing it.
+    ///
+    /// The loop this prevents: `index_vault` reads all 50 notes, inotify reports 50
+    /// `IN_ACCESS` events, the debouncer fires, the daemon reindexes, which reads all 50
+    /// notes again. It never settles. The end-to-end watcher test below does not catch
+    /// this — it passes happily while the daemon spins — so it is asserted directly.
+    #[test]
+    fn reading_a_file_is_not_a_change_to_it() {
+        use notify::EventKind;
+        use notify::event::{AccessKind, CreateKind, DataChange, MetadataKind, ModifyKind, RemoveKind};
+
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Read)));
+        assert!(!is_content_change(&EventKind::Access(AccessKind::Any)));
+        // atime is metadata, and reading a file changes it.
+        assert!(!is_content_change(&EventKind::Modify(ModifyKind::Metadata(
+            MetadataKind::AccessTime
+        ))));
+
+        assert!(is_content_change(&EventKind::Create(CreateKind::File)));
+        assert!(is_content_change(&EventKind::Remove(RemoveKind::File)));
+        assert!(is_content_change(&EventKind::Modify(ModifyKind::Data(
+            DataChange::Content
+        ))));
+        // nvim's atomic save arrives as a rename pair.
+        assert!(is_content_change(&EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Both
+        ))));
     }
 
     /// Saving a file makes it searchable without anyone asking for a reindex.
