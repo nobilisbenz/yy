@@ -662,11 +662,12 @@ impl Dock {
     /// Open or close the graph panel.
     ///
     /// The first open pays for reading the vault and laying it out; later ones are free.
-    /// A failure to load is not fatal — the dock is still a dock — so it is reported and
-    /// the panel simply stays shut.
+    /// A failure to load is not fatal — the dock is still a dock — but a keypress that
+    /// silently does nothing looks broken, so the failure is surfaced in the status line.
     fn set_graph_visible(&mut self, visible: bool) {
         self.graph_visible = visible;
         if !visible {
+            self.status_line = String::from("graph hidden");
             return;
         }
 
@@ -675,6 +676,15 @@ impl Dock {
                 Ok(panel) => self.graph = Some(panel),
                 Err(err) => {
                     tracing::error!("could not open the graph: {err:#}");
+                    // `resolve(None)` fails with `reading <path>; run yalive or pass --vault`
+                    // when no `last-vault` exists — that single line tells the user both
+                    // what went wrong and what to do, so it is shown verbatim.
+                    let message = err
+                        .chain()
+                        .last()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| err.to_string());
+                    self.status_line = format!("graph: {message}");
                     self.graph_visible = false;
                     return;
                 }
