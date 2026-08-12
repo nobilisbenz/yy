@@ -43,7 +43,7 @@ everything after that as optional increments, each independently shippable.
 | 3 | [`04-stage-3-actions.md`](04-stage-3-actions.md) | ✅ **done** — `Alt+1..9` jumps to note, code, video timestamp, app, project |
 | 4 | [`05-stage-4-context.md`](05-stage-4-context.md) | ✅ **done** — same query ranks differently depending on the focused window |
 | 5 | [`06-stage-5-semantic.md`](06-stage-5-semantic.md) | Paraphrases retrieve the right note |
-| 6 | [`07-stage-6-corrections.md`](07-stage-6-corrections.md) | Correct once; similar future questions use the correction |
+| 6 | [`07-stage-6-corrections.md`](07-stage-6-corrections.md) | 🟨 exact-match corrections ship; fuzzy measured and off — needs a bigger model |
 | 7 | [`08-stage-7-benchmark.md`](08-stage-7-benchmark.md) | 🟨 harness built and gating; needs ~40 rated questions to tune with |
 | — | [`09-decisions.md`](09-decisions.md) | Stack rationale, deviations from the spec, open risks |
 

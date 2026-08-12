@@ -68,6 +68,12 @@ fn body_height(dock: &Dock) -> f32 {
         DockState::Input => {}
     }
 
+    if dock.correcting.is_some() {
+        // `view::correction_editor` is a text input with its own padding.
+        height += line(tokens::FONT_ANSWER) + 2.0 * tokens::GAP_TIGHT;
+        blocks += 1;
+    }
+
     if let Some(source) = &dock.source {
         height += line(tokens::FONT_META);
         // `view::source_badge` stacks the explanation under the path, so it is a second

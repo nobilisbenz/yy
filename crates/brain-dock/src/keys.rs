@@ -24,6 +24,10 @@ pub enum Command {
     SelectPreviousAction,
     /// `Alt+1..9`; carries a zero-based index.
     Activate(usize),
+    /// Edit the answer on screen into a correction (spec §4's Correction state).
+    Correct,
+    /// Save the edited correction.
+    SaveCorrection,
     /// Mark the answer on screen good or bad.
     ///
     /// One keystroke, and after a fortnight of ordinary use the daemon has a labelled
@@ -43,6 +47,8 @@ impl Command {
             "history-next" => Self::HistoryNext,
             "action-next" => Self::SelectNextAction,
             "action-previous" => Self::SelectPreviousAction,
+            "correct" => Self::Correct,
+            "save-correction" => Self::SaveCorrection,
             "rate-good" => Self::Rate(true),
             "rate-bad" => Self::Rate(false),
             other => {

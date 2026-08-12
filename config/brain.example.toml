@@ -134,6 +134,22 @@ model = "~/.local/share/brain/models/Qwen_Qwen3-1.7B-Q5_K_M.gguf"
 # [llm.profiles.quality]
 # model = "~/.local/share/brain/models/Qwen3-4B-Instruct-2507-Q4_K_M.gguf"
 
+# Correction memory (spec §33). Correct an answer once and it applies again.
+[corrections]
+enabled = true
+# Similarity a stored question must reach to apply to a new one. Lexical
+# (Jaccard over word sets) until Stage 5 embeddings land, so it runs much lower
+# than the 0.82 the plan assumes for cosine similarity.
+match_threshold = 0.5
+# Apply corrections to *similar* questions, not only identical ones.
+#
+# Off because it measurably does not work at 1.7B: the correction is injected
+# and the model answers from the retrieved sources anyway — tested at the top of
+# the prompt, adjacent to the question, with an explicit system rule, and with
+# the competing sources cut to one. An exact match needs no model at all and is
+# exact, so that path is always on. Try this with profile = "quality".
+fuzzy = false
+
 [answers]
 # Do not let the model improvise from pretraining. A confident "not in your
 # files" is a feature (spec §45).

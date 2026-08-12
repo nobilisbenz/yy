@@ -131,6 +131,8 @@ pub enum Message {
     /// The XID, from `window::raw_id`. Adoption happens on receipt.
     Adopted(u64),
     QueryChanged(String),
+    /// The correction editor's text changed.
+    CorrectionChanged(String),
     /// The debounce after a keystroke has elapsed. Carries the generation it was
     /// scheduled for, so only the most recent keystroke's timer does anything.
     SearchDebounceElapsed(u64),
@@ -218,6 +220,12 @@ pub struct Dock {
     live_query: Option<Uuid>,
     /// What `live_query` was searching for, so an unchanged query is not re-sent.
     live_text: String,
+    /// The in-progress correction text, when the answer is being edited.
+    ///
+    /// `Some` *is* spec §4's Correction state — kept here rather than as a `DockState`
+    /// variant because the answer stays on screen underneath and the state machine already
+    /// distinguishes what is shown, not what is focused.
+    pub correcting: Option<String>,
 }
 
 impl Dock {
@@ -251,6 +259,7 @@ impl Dock {
             search_generation: 0,
             live_query: None,
             live_text: String::new(),
+            correcting: None,
         }
     }
 
@@ -382,6 +391,11 @@ impl Dock {
 
             Message::Ipc(event) => self.on_ipc(event),
 
+            Message::CorrectionChanged(text) => {
+                self.correcting = Some(text);
+                Task::none()
+            }
+
             Message::QueryChanged(text) => {
                 self.query = text;
                 self.schedule_search()
@@ -402,6 +416,11 @@ impl Dock {
                 // Esc walks back one step rather than hiding outright, and it
                 // never clears the answer — reopening a second later should
                 // show the previous result (spec §42).
+                // Esc walks back one step, and an open editor is the innermost step.
+                if self.correcting.take().is_some() {
+                    self.status_line = String::from("correction discarded");
+                    return Task::none();
+                }
                 match self.state {
                     DockState::Answer | DockState::NoAnswer | DockState::Searching => {
                         self.state = DockState::Input;
@@ -819,6 +838,29 @@ impl Dock {
                     return self.dispatch(Message::ActivateAction(index));
                 }
             }
+            Command::Correct => {
+                // Pre-load the answer so a correction is an edit rather than a retype —
+                // most corrections change a flag or a path, not the whole sentence.
+                if self.answer.is_empty() || self.current_query.is_none() {
+                    return Task::none();
+                }
+                self.correcting = Some(self.answer.clone());
+                self.status_line = String::from("editing · Ctrl+Enter saves, Esc cancels");
+                return iced::widget::operation::focus(view::correction_input_id());
+            }
+            Command::SaveCorrection => {
+                let (Some(answer), Some(id)) = (self.correcting.take(), self.current_query)
+                else {
+                    return Task::none();
+                };
+                if answer.trim().is_empty() {
+                    return Task::none();
+                }
+                self.answer = answer.clone();
+                self.send(ClientRequest::SaveCorrection { id, answer });
+                self.status_line = String::from("correction saved");
+                return Task::none();
+            }
             Command::Rate(good) => {
                 let Some(id) = self.current_query else {
                     return Task::none();
@@ -1055,6 +1097,68 @@ mod tests {
         assert!(dock.answer.is_empty());
     }
 
+    #[test]
+    fn correcting_preloads_the_answer_so_it_is_an_edit_not_a_retype() {
+        // Most corrections change a flag or a path, not the whole sentence.
+        let mut dock = dock();
+        dock.current_query = Some(Uuid::new_v4());
+        dock.answer = "Use rsync to deploy.".into();
+
+        let _ = dock.dispatch(Message::Command(keys::Command::Correct));
+        assert_eq!(dock.correcting.as_deref(), Some("Use rsync to deploy."));
+    }
+
+    #[test]
+    fn there_is_nothing_to_correct_without_an_answer() {
+        let mut dock = dock();
+        dock.current_query = Some(Uuid::new_v4());
+        let _ = dock.dispatch(Message::Command(keys::Command::Correct));
+        assert!(dock.correcting.is_none());
+    }
+
+    #[test]
+    fn escape_closes_the_editor_before_it_closes_anything_else() {
+        // Esc walks back one step, and an open editor is the innermost step — dismissing
+        // the whole dock instead would throw away what was being typed.
+        let mut dock = dock();
+        dock.current_query = Some(Uuid::new_v4());
+        dock.answer = "Use rsync.".into();
+        dock.state = DockState::Answer;
+
+        let _ = dock.dispatch(Message::Command(keys::Command::Correct));
+        let _ = dock.dispatch(Message::Dismiss);
+
+        assert!(dock.correcting.is_none(), "the editor stayed open");
+        assert_eq!(dock.state, DockState::Answer, "the answer was dismissed too");
+    }
+
+    #[test]
+    fn saving_a_correction_replaces_the_answer_on_screen() {
+        let mut dock = dock();
+        dock.current_query = Some(Uuid::new_v4());
+        dock.answer = "Use rsync.".into();
+
+        let _ = dock.dispatch(Message::Command(keys::Command::Correct));
+        let _ = dock.dispatch(Message::CorrectionChanged("Use the container.".into()));
+        let _ = dock.dispatch(Message::Command(keys::Command::SaveCorrection));
+
+        assert!(dock.correcting.is_none());
+        assert_eq!(dock.answer, "Use the container.");
+    }
+
+    #[test]
+    fn an_empty_correction_is_not_saved() {
+        let mut dock = dock();
+        dock.current_query = Some(Uuid::new_v4());
+        dock.answer = "Use rsync.".into();
+
+        let _ = dock.dispatch(Message::Command(keys::Command::Correct));
+        let _ = dock.dispatch(Message::CorrectionChanged("   ".into()));
+        let _ = dock.dispatch(Message::Command(keys::Command::SaveCorrection));
+
+        assert_eq!(dock.answer, "Use rsync.", "the answer was blanked");
+    }
+
     fn source_ref(uid: &str) -> SourceRef {
         SourceRef {
             section_id: brain_proto::SectionId(0),
@@ -1110,6 +1214,7 @@ fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> 
 
     if let iced::keyboard::Key::Named(named) = key {
         match named {
+            Named::Enter if modifiers.command() => return command("save-correction"),
             Named::Escape => return Some(Message::Dismiss),
             Named::ArrowUp if !modifiers.command() => {
                 return command("history-previous");
@@ -1136,6 +1241,7 @@ fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> 
             // keys keeps rating a reflex rather than something to look up.
             "g" => command("rate-good"),
             "b" => command("rate-bad"),
+            "e" => command("correct"),
             _ => None,
         };
     }

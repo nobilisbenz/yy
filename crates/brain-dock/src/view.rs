@@ -180,6 +180,10 @@ fn body(dock: &Dock, palette: Palette) -> Element<'_, Message> {
         DockState::Input => {}
     }
 
+    if let Some(text) = &dock.correcting {
+        body = body.push(correction_editor(text, palette));
+    }
+
     if let Some(source) = &dock.source {
         body = body.push(source_badge(source, dock.extra_sources, palette));
     }
@@ -196,6 +200,40 @@ fn body(dock: &Dock, palette: Palette) -> Element<'_, Message> {
             bottom: tokens::PAD_Y,
             left: tokens::PAD_X,
             right: tokens::PAD_X,
+        })
+        .into()
+}
+
+/// The id of the correction editor, so focus can be moved to it.
+pub fn correction_input_id() -> Id {
+    Id::from("dock-correction")
+}
+
+/// Editing an answer into a correction (spec §4's Correction state).
+///
+/// Rendered *under* the answer rather than replacing it, so the thing being corrected stays
+/// visible while it is being rewritten.
+fn correction_editor(text: &str, palette: Palette) -> Element<'_, Message> {
+    text_input("correct the answer…", text)
+        .id(correction_input_id())
+        .on_input(Message::CorrectionChanged)
+        .on_submit(Message::Command(crate::keys::Command::SaveCorrection))
+        .font(tokens::FONT)
+        .size(tokens::FONT_ANSWER)
+        .padding(tokens::GAP_TIGHT)
+        .style(move |_theme, _status| text_input::Style {
+            background: Color::TRANSPARENT.into(),
+            // Outlined rather than filled: the editor sits under the answer it is
+            // rewriting, and a filled box there reads as a second answer.
+            border: Border {
+                color: palette.accent,
+                width: 1.0,
+                radius: tokens::RADIUS.into(),
+            },
+            icon: palette.fg_faint,
+            placeholder: palette.fg_faint,
+            value: palette.fg,
+            selection: palette.action_bg_focus,
         })
         .into()
 }

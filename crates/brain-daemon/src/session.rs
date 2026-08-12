@@ -202,6 +202,24 @@ fn handle(
             }
         }
 
+        ClientRequest::SaveCorrection { id, answer } => {
+            let Some(backend) = services.backend.clone() else {
+                return;
+            };
+            let events = events.clone();
+            // Spawned because saving re-checks staleness against the index, which is a
+            // read this connection should not wait on.
+            tokio::spawn(async move {
+                if let Err(error) = backend.correct(id, &answer) {
+                    tracing::warn!(%error, "could not save the correction");
+                    let _ = events.send(ServerEvent::Error {
+                        id: Some(id),
+                        message: error.to_string(),
+                    });
+                }
+            });
+        }
+
         ClientRequest::RateAnswer { id, good } => {
             let Some(backend) = &services.backend else {
                 return;

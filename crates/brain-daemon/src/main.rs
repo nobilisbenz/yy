@@ -75,9 +75,22 @@ async fn main() -> Result<()> {
         // `loaded` for a server that died ten minutes ago is the most confusing possible
         // failure — the tool quietly does less and says nothing.
         tokio::spawn(async move {
+            let mut seen_generation = u64::MAX;
             loop {
                 daemon.record_model(reporting.model_report());
                 daemon.record_provenance(reporting.provenance_counts());
+
+                // Staleness is re-checked whenever the index moves, which covers every path
+                // that can rewrite a note: `brainctl reindex`, the file watcher, and the
+                // initial walk. Hooking only one of them leaves a correction confidently
+                // citing a note that changed underneath it.
+                let generation = reporting.index().generation();
+                if generation != seen_generation {
+                    seen_generation = generation;
+                    reporting.refresh_correction_staleness().await;
+                    daemon.record_stale_corrections(reporting.stale_corrections());
+                }
+
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         });
@@ -97,6 +110,7 @@ async fn main() -> Result<()> {
                         sections = stats.sections,
                         "initial index ready"
                     );
+
                 }
                 Err(error) => tracing::error!(%error, "the initial index failed"),
             }

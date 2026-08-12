@@ -76,6 +76,7 @@ struct Inner {
     model: ModelReport,
     /// `(total, good, bad)` provenance rows.
     provenance: (usize, usize, usize),
+    stale_corrections: usize,
     /// What was focused at the last summon. Queries that arrive without their own context —
     /// `brainctl ask` from a terminal — use this.
     context: brain_proto::DesktopContext,
@@ -113,6 +114,7 @@ impl Daemon {
                 counts: IndexStats::default(),
                 model: ModelReport::default(),
                 provenance: (0, 0, 0),
+                stale_corrections: 0,
                 context: brain_proto::DesktopContext::default(),
             }),
         }
@@ -250,6 +252,11 @@ impl Daemon {
         self.lock().provenance = counts;
     }
 
+    /// Corrections whose source has been rewritten since they were confirmed.
+    pub fn record_stale_corrections(&self, count: usize) {
+        self.lock().stale_corrections = count;
+    }
+
     /// The context captured at the last summon.
     pub fn context(&self) -> brain_proto::DesktopContext {
         self.lock().context.clone()
@@ -280,6 +287,7 @@ impl Daemon {
             answers_recorded: inner.provenance.0 as u64,
             answers_rated_good: inner.provenance.1 as u64,
             answers_rated_bad: inner.provenance.2 as u64,
+            stale_corrections: inner.stale_corrections as u64,
         }
     }
 

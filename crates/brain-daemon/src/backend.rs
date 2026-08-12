@@ -20,7 +20,7 @@ use brain_engine::actions::{Action, ActionError};
 use brain_engine::llm::{Chunk, Llm, ModelState};
 use brain_engine::desktop::DesktopIndex;
 use brain_engine::store::{Rating, Store};
-use brain_engine::{Ranked, actions, prompt, store};
+use brain_engine::{Ranked, actions, corrections, prompt, store};
 use brain_index::{Index, IndexStats, Watcher};
 use brain_proto::{CacheStatus, ServerEvent, SourceRef, TimingInfo};
 use tokio::sync::mpsc::UnboundedSender;
@@ -43,6 +43,18 @@ const SNIPPET: usize = 240;
 /// block and look exactly like the model ignoring its instructions.
 const SCAFFOLD_TOKENS: usize = 320;
 
+/// One remembered query: the question, and the sections it was answered from with the hash
+/// each had at the time. The hashes are what make a correction's staleness detectable.
+struct Asked {
+    query: Uuid,
+    question: String,
+    sources: Vec<(String, String)>,
+}
+
+/// Sources packed alongside an applied correction. See where this is used for why it is
+/// smaller than `search.context_sections`.
+const CORRECTED_CONTEXT_SECTIONS: usize = 1;
+
 pub struct Backend {
     config: Config,
     index: Index,
@@ -56,6 +68,8 @@ pub struct Backend {
     recent: Mutex<VecDeque<(Uuid, Vec<Action>)>>,
     /// Provenance row id per query, so a rating keystroke can find what it refers to.
     provenance: Mutex<VecDeque<(Uuid, i64)>>,
+    /// What each recent query asked, so a correction knows what it corrects.
+    asked: Mutex<VecDeque<Asked>>,
     /// Installed applications, for resolving `@app`. Scanned once at startup: the set
     /// changes when something is installed, which is rare next to how often it is read.
     apps: DesktopIndex,
@@ -122,6 +136,7 @@ impl Backend {
             store,
             recent: Mutex::new(VecDeque::new()),
             provenance: Mutex::new(VecDeque::new()),
+            asked: Mutex::new(VecDeque::new()),
             _watcher: watcher,
         })
     }
@@ -240,6 +255,18 @@ impl Backend {
             });
             return Some(timing);
         }
+
+        // Recorded here rather than in `generate`, because a retrieval-only query is still
+        // a question the user can correct — and search-as-you-type aside, that is exactly
+        // how `brainctl ask --correct` and a dock correction on a sources-only answer work.
+        self.remember_asked(
+            id,
+            &text,
+            &retrieval.results[..retrieval
+                .results
+                .len()
+                .min(self.config.search.context_sections)],
+        );
 
         let sources: Vec<SourceRef> = retrieval.results.iter().map(source_ref).collect();
 
@@ -372,7 +399,7 @@ impl Backend {
 
         // Record what was retrieved before generating, so the row exists even if generation
         // fails — the benchmark cares about the retrieved set, not the prose.
-        let packed: Vec<(String, String)> = results
+        let mut packed: Vec<(String, String)> = results
             .iter()
             .take(pack.sources_used)
             .map(|entry| (entry.hit.section_uid.clone(), entry.hit.body.clone()))
@@ -386,12 +413,52 @@ impl Backend {
             }
         }
 
+        // A correction the user already confirmed for this question. Looked up *before* the
+        // model is called, because an exact match means there is nothing to generate.
+        let correction = self.correction_for(question);
+
+        if let Some((correction, corrections::Match::Exact)) = &correction {
+            // Identical question, approved answer. Paying 600 ms for a 1.7B model to
+            // paraphrase text the user already wrote is worse in every dimension.
+            tracing::debug!("answering from an exact correction");
+            let _ = events.send(ServerEvent::GenerationStarted { id });
+            let _ = events.send(ServerEvent::Token {
+                id,
+                text: correction.good_answer.clone(),
+            });
+            return Some((prompt_ms, 0, 0));
+        }
+
+        if let Some((correction, _)) = &correction {
+            // A rewording. Injected as an authoritative source and adapted by the model,
+            // rather than returned verbatim — stored text answering a differently-phrased
+            // question is a canned answer to something that was not quite asked.
+            //
+            // Repacked with **fewer sources** first. The correction is meant to override
+            // them, and measurably does not at this model size: with five retrieved
+            // sections all saying one thing, Qwen3-1.7B answered from the sections and
+            // ignored the correction, at the top of the prompt and adjacent to the question
+            // alike. Asking a 1.7B model to resolve a five-against-one conflict is asking
+            // the wrong thing of it; giving the correction less to argue with is the fix
+            // that works without pretending the model is bigger than it is.
+            let narrowed = results.len().min(CORRECTED_CONTEXT_SECTIONS);
+            pack = prompt::build(question, &results[..narrowed], budget);
+            pack.with_correction(&corrections::prompt_block(correction));
+
+            // The key has to describe what was actually sent. Narrowing the pack without
+            // this makes two materially different prompts share one cache entry.
+            packed.truncate(narrowed);
+        }
+
         let key = store::answer_key(
             &packed,
             self.llm.model_name().as_deref(),
             prompt::PROMPT_VERSION,
             self.config.llm.max_output_tokens,
             self.config.llm.temperature,
+            self.store
+                .as_ref()
+                .map_or(0, |store| store.correction_version()),
         );
 
         // A cache hit renders **immediately**, not replayed token by token. Fake-streaming
@@ -445,6 +512,136 @@ impl Backend {
 
         tracing::info!(ttft_ms, output_tokens, "generated");
         Some((prompt_ms, ttft_ms, output_tokens))
+    }
+
+    /// The correction to apply to this question, if any.
+    fn correction_for(
+        &self,
+        question: &str,
+    ) -> Option<(corrections::Correction, corrections::Match)> {
+        if !self.config.corrections.enabled {
+            return None;
+        }
+        let store = self.store.as_ref()?;
+        let stored = store.corrections().ok()?;
+
+        let found = corrections::best(question, &stored, self.config.corrections.match_threshold)
+            // A fuzzy match is discarded unless it is switched on; see the config comment
+            // for the measurement behind that default.
+            .filter(|(_, kind)| {
+                *kind == corrections::Match::Exact || self.config.corrections.fuzzy
+            });
+
+        tracing::debug!(
+            stored = stored.len(),
+            normalized = %corrections::normalize(question),
+            matched = ?found.as_ref().map(|(c, kind)| (c.normalized.clone(), *kind)),
+            "correction lookup"
+        );
+        found.map(|(correction, kind)| (correction.clone(), kind))
+    }
+
+    fn remember_asked(&self, id: Uuid, question: &str, packed: &[Ranked]) {
+        // The section bodies are hashed rather than kept, so a correction records *what the
+        // source looked like* without this queue holding a copy of the vault.
+        let sources = packed
+            .iter()
+            .map(|entry| {
+                (
+                    entry.hit.section_uid.clone(),
+                    blake3::hash(entry.hit.body.as_bytes()).to_hex().to_string(),
+                )
+            })
+            .collect();
+
+        let mut asked = self
+            .asked
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        asked.push_back(Asked {
+            query: id,
+            question: question.to_string(),
+            sources,
+        });
+        while asked.len() > REMEMBERED_QUERIES {
+            asked.pop_front();
+        }
+    }
+
+    /// Save a corrected answer for the question behind `query`.
+    pub fn correct(&self, query: Uuid, answer: &str) -> Result<()> {
+        let remembered = {
+            let asked = self
+                .asked
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            asked
+                .iter()
+                .find(|entry| entry.query == query)
+                .map(|entry| (entry.question.clone(), entry.sources.clone()))
+        };
+
+        let Some((question, sources)) = remembered else {
+            tracing::debug!(%query, "corrected a query the daemon no longer remembers");
+            return Ok(());
+        };
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+
+        store.save_correction(&question, answer, &sources)?;
+        tracing::info!(question = %question, "correction saved");
+        Ok(())
+    }
+
+    /// Re-check which corrections have had a source rewritten under them.
+    ///
+    /// Called after a reindex. A stale correction is still applied — silently dropping an
+    /// explicit user correction is worse than showing a possibly-outdated one — but with a
+    /// weaker marker in the prompt and a lower score.
+    pub async fn refresh_correction_staleness(&self) {
+        let Some(store) = &self.store else { return };
+        let Ok(uids) = store.corrections().map(|all| {
+            all.iter()
+                .flat_map(|correction| correction.sources.iter().map(|(uid, _)| uid.clone()))
+                .collect::<Vec<_>>()
+        }) else {
+            return;
+        };
+        if uids.is_empty() {
+            return;
+        }
+
+        let Ok(rows) = self
+            .index
+            .read(move |database| Ok(database.sections_by_uids(&uids)?))
+            .await
+        else {
+            return;
+        };
+
+        let current: Vec<(String, String)> = rows
+            .into_iter()
+            .map(|row| {
+                (
+                    row.uid,
+                    blake3::hash(row.body.as_bytes()).to_hex().to_string(),
+                )
+            })
+            .collect();
+
+        match store.refresh_staleness(&current) {
+            Ok(0) => {}
+            Ok(changed) => tracing::info!(changed, "correction staleness updated"),
+            Err(error) => tracing::warn!(%error, "could not update correction staleness"),
+        }
+    }
+
+    pub fn stale_corrections(&self) -> usize {
+        self.store
+            .as_ref()
+            .and_then(|store| store.stale_corrections().ok())
+            .unwrap_or(0)
     }
 
     fn remember_provenance(&self, query: Uuid, row: i64) {

@@ -32,6 +32,11 @@ enum Command {
         /// Retrieve and print sources without generating an answer.
         #[arg(long)]
         no_llm: bool,
+        /// Save this as the correct answer to the question.
+        ///
+        /// Asks, then corrects — the same two steps the dock's Ctrl+E performs, scripted.
+        #[arg(long)]
+        correct: Option<String>,
         /// Ignore what was focused when ranking.
         ///
         /// When context ranking misfires, the only way to confirm that is what happened is
@@ -81,11 +86,26 @@ enum Command {
         #[arg(long, default_value_t = 20)]
         min_questions: usize,
     },
+    /// Review stored corrections.
+    #[command(subcommand)]
+    Corrections(CorrectionCommand),
     /// Check the environment: config, socket, compositor, openers.
     Doctor,
     /// The graph panel inside the dock.
     #[command(subcommand)]
     Graph(GraphCommand),
+}
+
+#[derive(Subcommand, Debug)]
+enum CorrectionCommand {
+    /// List corrections, newest first.
+    List {
+        /// Only those whose source has been rewritten since they were confirmed.
+        #[arg(long)]
+        stale: bool,
+    },
+    /// Forget a correction.
+    Delete { id: i64 },
 }
 
 #[derive(Subcommand, Debug)]
@@ -129,6 +149,7 @@ async fn run(command: Command) -> Result<()> {
         Command::BenchExport { out, min_questions } => {
             return export_benchmark(out.as_deref(), min_questions);
         }
+        Command::Corrections(ref command) => return manage_corrections(command),
         _ => {}
     }
 
@@ -166,12 +187,14 @@ async fn run(command: Command) -> Result<()> {
             query,
             no_llm,
             no_context,
+            correct,
         } => {
             let text = query.join(" ");
             anyhow::ensure!(!text.trim().is_empty(), "no question given");
+            let id = Uuid::new_v4();
             connection
                 .send(&ClientRequest::Query {
-                    id: Uuid::new_v4(),
+                    id,
                     text,
                     // An empty context means "use the last summon's"; the daemon cannot
                     // tell that from "I deliberately want none", so say which.
@@ -180,14 +203,29 @@ async fn run(command: Command) -> Result<()> {
                     } else {
                         Default::default()
                     },
-                    retrieval_only: no_llm,
+                    retrieval_only: no_llm || correct.is_some(),
                 })
                 .await?;
+
+            if let Some(answer) = correct {
+                // Retrieval has to finish first: the correction records which sections the
+                // answer was based on, and the daemon only knows those once it has run.
+                stream_answer(&mut connection).await?;
+                connection
+                    .send(&ClientRequest::SaveCorrection { id, answer })
+                    .await?;
+                // Sent, not confirmed: the daemon saves asynchronously and this process
+                // exits before that lands. Claiming otherwise would be a small lie that
+                // shows up as `corrections list` looking empty a moment later.
+                println!("correction sent");
+                return Ok(());
+            }
             return stream_answer(&mut connection).await;
         }
-        Command::Doctor | Command::Sources | Command::BenchExport { .. } => {
-            unreachable!("handled above")
-        }
+        Command::Doctor
+        | Command::Sources
+        | Command::BenchExport { .. }
+        | Command::Corrections(_) => unreachable!("handled above"),
     }
 
     // Fire-and-forget commands still need the write to reach the kernel before
@@ -252,6 +290,15 @@ async fn print_status(connection: &mut ClientConnection) -> Result<()> {
                         report.answers_rated_bad
                     ),
                 );
+                if report.stale_corrections > 0 {
+                    field(
+                        "stale corrections",
+                        format!(
+                            "{} (brainctl corrections list --stale)",
+                            report.stale_corrections
+                        ),
+                    );
+                }
                 if let Some(t) = report.last_query {
                     field(
                         "last query",
@@ -576,6 +623,54 @@ fn count_matching(source: &brain_core::Source) -> Result<usize> {
         }
     }
     Ok(count)
+}
+
+/// List or delete stored corrections.
+///
+/// A stale correction is one whose source note was rewritten after it was confirmed. It is
+/// still applied — silently dropping an explicit user correction is worse than showing a
+/// possibly-outdated one — so this is where you re-confirm or forget it.
+fn manage_corrections(command: &CorrectionCommand) -> Result<()> {
+    let path = brain_engine::store::Store::default_path().context("could not locate the store")?;
+    let store = brain_engine::store::Store::open(&path)?;
+
+    match command {
+        CorrectionCommand::Delete { id } => {
+            if store.delete_correction(*id)? {
+                println!("deleted correction {id}");
+            } else {
+                println!("no correction with id {id}");
+            }
+        }
+        CorrectionCommand::List { stale } => {
+            let all = store.corrections()?;
+            let shown: Vec<_> = all
+                .iter()
+                .filter(|correction| !*stale || correction.stale)
+                .collect();
+
+            if shown.is_empty() {
+                println!("no corrections{}", if *stale { " are stale" } else { "" });
+                return Ok(());
+            }
+
+            for correction in shown {
+                let mark = if correction.stale { "  (stale)" } else { "" };
+                println!("[{}]{mark} {}", correction.id, correction.question);
+                println!("    {}", correction.good_answer);
+                if !correction.sources.is_empty() {
+                    let uids: Vec<&str> = correction
+                        .sources
+                        .iter()
+                        .map(|(uid, _)| uid.as_str())
+                        .collect();
+                    println!("    based on: {}", uids.join(", "));
+                }
+                println!();
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Write a benchmark question set from the answers marked good.

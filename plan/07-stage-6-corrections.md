@@ -1,5 +1,32 @@
 # Stage 6 — Correction memory
 
+> **Status: the exact-match path works and ships on; the fuzzy path is built, measured, and
+> off by default.**
+>
+> ```text
+> correct "how do I deploy?" once
+> re-ask, same question        → the corrected answer, 2 ms, no model call
+> re-ask, "how should I deploy" → same (stopwords normalise away)
+> ask about backups            → correction does not leak
+> edit a source note           → marked stale within seconds; brainctl status reports it
+> ```
+>
+> **The fuzzy path does not work at this model size, and that is the finding.** A reworded
+> question does match — the lookup logs `matched=Some(("deploy", Fuzzy))` — and the
+> correction is injected. Qwen3-1.7B then answers from the retrieved sources and ignores it.
+> Tried, in order: an explicit system rule (rule 11), moving the block from the top of the
+> prompt to immediately before the question, and cutting the competing sources from five to
+> one. None changed the answer. So `[corrections] fuzzy` defaults to **false**: exact matches
+> need no model and are exact, and the fuzzy path waits for `profile = "quality"` or for the
+> embeddings that would justify returning it verbatim.
+>
+> This stage's stated prerequisite is Stage 5, which is deferred, so matching is lexical —
+> §6.3's "cheap parallel path" without the semantic one beside it. A question that shares no
+> vocabulary with the stored one is missed, which is recorded as a test rather than hidden.
+>
+> Not built: `query_sources` with per-stage ranks (§6.1) beyond what `provenance` already
+> records, and trust weighting (§6.5).
+
 **Goal:** correct an answer once; a semantically similar future question uses the
 correction.
 

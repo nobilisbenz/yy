@@ -20,6 +20,7 @@
 //! only asks each signal for an ordering, which is the thing both can honestly supply.
 
 pub mod actions;
+pub mod corrections;
 pub mod desktop;
 pub mod llm;
 pub mod prompt;

@@ -72,6 +72,42 @@ pub struct Config {
     pub answers: Answers,
     pub context: Context,
     pub retrieval: Retrieval,
+    pub corrections: Corrections,
+}
+
+/// Correction memory (spec §33).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Corrections {
+    pub enabled: bool,
+    /// Similarity a stored question must reach to be applied to a new one.
+    ///
+    /// The plan starts this at 0.82 against *embedding* cosine similarity. This build
+    /// matches lexically instead — Stage 5 is deferred — and Jaccard over word sets runs
+    /// much lower for the same pair, so the default is scaled to match. Tune it against the
+    /// benchmark, not by feel: too low and a correction about deployment answers a question
+    /// about backups.
+    pub match_threshold: f32,
+    /// Apply corrections to *similar* questions, not only identical ones.
+    ///
+    /// **Off by default because it measurably does not work at this model size.** An exact
+    /// match returns the approved answer verbatim and is exact; a fuzzy match instead injects
+    /// the correction and asks the model to answer from it. Qwen3-1.7B ignored it and
+    /// answered from the retrieved sources instead — at the top of the prompt, adjacent to
+    /// the question, with rule 11 telling it not to, and even with the competing sources cut
+    /// to one. Turn this on with `[llm] profile = "quality"`, or once Stage 5 embeddings make
+    /// the matching good enough to justify returning it verbatim.
+    pub fuzzy: bool,
+}
+
+impl Default for Corrections {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            match_threshold: 0.5,
+            fuzzy: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

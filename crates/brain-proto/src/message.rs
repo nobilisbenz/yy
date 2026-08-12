@@ -39,6 +39,13 @@ pub enum ClientRequest {
     /// Abandon a running query. Idempotent; unknown ids are ignored.
     Cancel { id: Uuid },
 
+    /// Replace the answer to a query with a corrected one.
+    ///
+    /// The correction is stored against the *question*, and applied to future questions
+    /// that match it. Spec §33: this is how the assistant learns immediately, as distinct
+    /// from fine-tuning, which is for behaviour rather than facts.
+    SaveCorrection { id: Uuid, answer: String },
+
     /// Mark the answer to a query good or bad.
     ///
     /// One keystroke, and after a fortnight of ordinary use the daemon has a labelled
@@ -324,6 +331,10 @@ pub struct StatusReport {
     pub answers_rated_good: u64,
     #[serde(default)]
     pub answers_rated_bad: u64,
+    /// Corrections whose source note changed after they were confirmed. Still applied, but
+    /// worth reviewing — `brainctl corrections list --stale`.
+    #[serde(default)]
+    pub stale_corrections: u64,
 }
 
 #[cfg(test)]
