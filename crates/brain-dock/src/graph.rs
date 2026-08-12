@@ -103,9 +103,9 @@ impl GraphPanel {
             Interaction::Camera(camera) => self.camera = camera,
             Interaction::Selected(index) => self.selected = Some(index),
             Interaction::Dragged { index, world } => {
-                self.layout.nodes[index].position = world;
-                // Pinned, or the simulation pulls the node out of the hand holding it.
-                self.layout.nodes[index].fixed = true;
+                // Refreshes the containment ring eagerly so a drag after the
+                // simulation has settled still moves the ring with the dot.
+                self.layout.drag_to(index, world);
             }
             Interaction::Activated(index) => {
                 return Some(self.layout.nodes[index].uid.clone());

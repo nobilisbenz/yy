@@ -359,6 +359,7 @@ mod tests {
             },
             ClientRequest::Cancel { id },
             ClientRequest::Toggle,
+            ClientRequest::ToggleGraph,
             ClientRequest::Show,
             ClientRequest::Hide,
             ClientRequest::Subscribe,

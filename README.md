@@ -36,10 +36,13 @@ $mod+a                  toggle the dock          (10–15 ms, measured)
 type + Enter            query → sources → streamed answer
 Esc                     hide, keeping the answer for the next summon
 Ctrl+L / Ctrl+C         clear query / copy answer to clipboard
+Ctrl+G / Ctrl+B         rate the answer good / bad
+Ctrl+E                  edit the answer into a correction
+Ctrl+Shift+G            toggle the graph panel under the answer
 Up / Down               query history
 Tab / Shift+Tab         cycle action buttons
 Alt+1..9                activate an action       (wired, targets land in Stage 3)
-brainctl graph toggle   graph panel under the answer, seeded on its source
+brainctl graph toggle   same panel, scripted for i3
 brainctl status|doctor|ask|toggle|show|hide
 ```
 

@@ -890,6 +890,13 @@ impl Dock {
                     return self.submit();
                 }
             }
+            Command::ToggleGraph => {
+                // The daemon owns the flag and broadcasts `SetGraphVisible` back to us;
+                // sending rather than flipping locally keeps the visibility single-sourced
+                // across `brainctl graph toggle`, the daemon, and the dock.
+                self.send(ClientRequest::ToggleGraph);
+                return Task::none();
+            }
             // Both need somewhere to put the result: the correction editor
             // (Stage 6) and the sources panel (Stage 1).
             Command::ShowSources | Command::EditAnswer => {
@@ -1169,6 +1176,56 @@ mod tests {
         assert_eq!(dock.answer, "Use rsync.", "the answer was blanked");
     }
 
+    #[test]
+    fn ctrl_shift_g_toggles_the_graph() {
+        // US layout sends Shift+g as "G"; some toolkits normalise to "g". Both must
+        // reach the same binding — otherwise one of two layouts silently does nothing.
+        let ctrl_shift = iced::keyboard::Modifiers::CTRL | iced::keyboard::Modifiers::SHIFT;
+
+        let from_capital = shortcut(
+            &iced::keyboard::Key::Character("G".into()),
+            ctrl_shift,
+        );
+        let from_lower = shortcut(
+            &iced::keyboard::Key::Character("g".into()),
+            ctrl_shift,
+        );
+
+        assert!(matches!(
+            from_capital,
+            Some(Message::Command(keys::Command::ToggleGraph))
+        ));
+        assert!(matches!(
+            from_lower,
+            Some(Message::Command(keys::Command::ToggleGraph))
+        ));
+    }
+
+    #[test]
+    fn ctrl_g_without_shift_is_still_rate_good() {
+        // The new Shift-extended binding must not eat the plain Ctrl+G rating shortcut.
+        let ctrl_only = iced::keyboard::Modifiers::CTRL;
+        let msg = shortcut(
+            &iced::keyboard::Key::Character("g".into()),
+            ctrl_only,
+        );
+        assert!(matches!(
+            msg,
+            Some(Message::Command(keys::Command::Rate(true)))
+        ));
+    }
+
+    #[test]
+    fn toggling_the_graph_does_not_change_local_state() {
+        // The daemon owns visibility and echoes the new value back as `SetGraphVisible`.
+        // A dock without that echo must stay closed — the shortcut is a request, not a flip.
+        let mut dock = dock();
+        assert!(!dock.graph_visible);
+
+        let _ = dock.dispatch(Message::Command(keys::Command::ToggleGraph));
+        assert!(!dock.graph_visible, "the dock flipped visibility locally");
+    }
+
     fn source_ref(uid: &str) -> SourceRef {
         SourceRef {
             section_id: brain_proto::SectionId(0),
@@ -1243,6 +1300,14 @@ fn shortcut(key: &iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> 
     };
 
     if modifiers.command() {
+        // Shift-extended commands come first: on a US layout Shift+g arrives as "G", and
+        // falling through to the unshifted branch would silently steal them.
+        if modifiers.shift() {
+            return match c.as_str() {
+                "G" | "g" => command("toggle-graph"),
+                _ => None,
+            };
+        }
         return match c.as_str() {
             "l" => command("clear"),
             "c" => command("copy-answer"),

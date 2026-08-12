@@ -33,6 +33,12 @@ pub enum Command {
     /// One keystroke, and after a fortnight of ordinary use the daemon has a labelled
     /// retrieval benchmark built from the questions actually asked (`PLAN.md` §6.3).
     Rate(bool),
+    /// Open or close the graph panel under the answer.
+    ///
+    /// The daemon owns the flag and relays the visibility to the dock, exactly as it
+    /// does for the dock itself — which is what keeps the shortcut stateless and
+    /// lets an i3 binding be a one-liner.
+    ToggleGraph,
 }
 
 impl Command {
@@ -51,6 +57,7 @@ impl Command {
             "save-correction" => Self::SaveCorrection,
             "rate-good" => Self::Rate(true),
             "rate-bad" => Self::Rate(false),
+            "toggle-graph" => Self::ToggleGraph,
             other => {
                 // `action-1` .. `action-9`, one-based in the UI because that is
                 // what the button labels show.
@@ -147,6 +154,7 @@ mod tests {
         assert_eq!(Command::parse("clear"), Some(Command::ClearQuery));
         assert_eq!(Command::parse("action-1"), Some(Command::Activate(0)));
         assert_eq!(Command::parse("action-9"), Some(Command::Activate(8)));
+        assert_eq!(Command::parse("toggle-graph"), Some(Command::ToggleGraph));
         assert_eq!(Command::parse("nonsense"), None);
         // `action-0` would underflow a zero-based index; the UI never sends it.
         assert_eq!(Command::parse("action-0"), None);
