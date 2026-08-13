@@ -111,7 +111,10 @@ url = ["xdg-open", "{url}"]
 # config synced between machines does not leave a dead button (spec §51).
 # Set it to a real player to open at the timestamp rather than at 0:00:
 #   video = ["mpv", "--start={seconds}", "{url}"]
-video = ["xdg-open", "{url}"]
+#
+# yClippy is the ecosystem's video surface: it opens the moment, keeps the clip
+# library, and shares this placeholder shape with yalive's `player` key.
+video = ["yclippy", "play", "{url}", "--at", "{seconds}"]
 
 # ---------------------------------------------------------------------------
 # Stage 2
