@@ -106,16 +106,16 @@ directory = ["xdg-open", "{path}"]
 url = ["xdg-open", "{url}"]
 # {seconds} is substituted for a video timestamp action (Stage 3).
 #
-# If this program is not installed the daemon falls back silently: yclippy if it
-# is present, then mpv, otherwise xdg-open with the timestamp rebuilt into the
-# URL. yalive's `player` and the Neovim plugin walk the same chain, so one
-# `@video` line opens the same way from every surface. So a
-# config synced between machines does not leave a dead button (spec §51).
-# Set it to a real player to open at the timestamp rather than at 0:00:
+# If the program named here is not installed the daemon falls back silently:
+# yclippy if it is present, then mpv, otherwise xdg-open with the timestamp
+# rebuilt into the URL. So a config synced between machines does not leave a
+# dead button (spec §51). Set it to a real player to open at the timestamp
+# rather than at 0:00:
 #   video = ["mpv", "--start={seconds}", "{url}"]
 #
-# yClippy is the ecosystem's video surface: it opens the moment, keeps the clip
-# library, and shares this placeholder shape with yalive's `player` key.
+# yClippy is the ecosystem's video surface: it opens the moment and keeps the
+# clip library, and is the preferred fallback above mpv — so a fresh `yclippy`
+# install makes a `@video` action open in yclippy without editing this file.
 video = ["yclippy", "play", "{url}", "--at", "{seconds}"]
 
 # ---------------------------------------------------------------------------

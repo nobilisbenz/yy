@@ -402,11 +402,12 @@ pub fn template_for(openers: &Openers, target: &Target) -> Vec<String> {
 /// failing (spec §51). Someone who configured `mpv` on one machine and syncs their config
 /// to another should get a working video button, not an error.
 ///
-/// `yclippy` comes first among the fallbacks because it is the ecosystem's own video
-/// surface: it understands the `@video` line's timestamp directly and can trim and name
-/// the moment afterwards. Installing it should be enough to make it the player
-/// everywhere, without editing three configurations — yalive's `src/player.rs` and the
-/// Neovim plugin walk the same chain.
+/// `yclippy` sits above `mpv` in the fallback chain because it is the ecosystem's own
+/// video surface: when `yclippy play {url} --at {seconds}` is on the PATH it understands
+/// the timestamp directly and can trim and name the moment afterwards. Today this chain
+/// is only walked by the daemon's `video_template` — yClippy is itself the destination,
+/// not a caller — so the practical effect of probing `yclippy` first is that a fresh
+/// `yclippy` install makes a `@video` action open in yclippy with no `[openers]` edit.
 fn video_template(openers: &Openers) -> Vec<String> {
     if opener_is_installed(&openers.video) {
         return openers.video.clone();
