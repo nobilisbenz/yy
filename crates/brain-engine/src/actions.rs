@@ -396,14 +396,31 @@ pub fn template_for(openers: &Openers, target: &Target) -> Vec<String> {
     }
 }
 
-/// Resolve the video handler: configured → `mpv` → `xdg-open`.
+/// Resolve the video handler: configured → `yclippy` → `mpv` → `xdg-open`.
 ///
 /// A configured handler whose binary is not installed **falls back silently** rather than
 /// failing (spec §51). Someone who configured `mpv` on one machine and syncs their config
 /// to another should get a working video button, not an error.
+///
+/// `yclippy` comes first among the fallbacks because it is the ecosystem's own video
+/// surface: it understands the `@video` line's timestamp directly and can trim and name
+/// the moment afterwards. Installing it should be enough to make it the player
+/// everywhere, without editing three configurations — yalive's `src/player.rs` and the
+/// Neovim plugin walk the same chain.
 fn video_template(openers: &Openers) -> Vec<String> {
     if opener_is_installed(&openers.video) {
         return openers.video.clone();
+    }
+
+    if opener_is_installed(&["yclippy".to_string()]) {
+        tracing::debug!("configured video handler is missing; using yclippy");
+        return vec![
+            "yclippy".into(),
+            "play".into(),
+            "{url}".into(),
+            "--at".into(),
+            "{seconds}".into(),
+        ];
     }
 
     if opener_is_installed(&["mpv".to_string()]) {
@@ -768,7 +785,24 @@ mod tests {
         };
         let template = video_template(&openers);
         assert_ne!(template[0], "definitely-not-a-player-xyz");
-        assert!(opener_is_installed(&template) || template[0] == "mpv");
+        // Whatever the machine has, the answer is one of the chain's rungs and
+        // always carries a `{url}` for `expand` to fill.
+        assert!(["yclippy", "mpv", "xdg-open"].contains(&template[0].as_str()));
+        assert!(template.iter().any(|part| part.contains("{url}")));
+    }
+
+    /// Installing the ecosystem's own video surface should be enough to make it
+    /// the player, without editing a configuration file.
+    #[test]
+    fn yclippy_is_preferred_over_mpv_when_nothing_is_configured() {
+        let openers = Openers {
+            video: vec!["definitely-not-a-player-xyz".into(), "{url}".into()],
+            ..openers()
+        };
+        let template = video_template(&openers);
+        if opener_is_installed(&["yclippy".to_string()]) {
+            assert_eq!(template[0], "yclippy");
+        }
     }
 
     #[test]
